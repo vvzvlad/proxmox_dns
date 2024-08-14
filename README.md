@@ -1,4 +1,5 @@
 
+```
 services:
   proxdns:
     image: vvzvlad/dns_proxy:latest
@@ -18,3 +19,4 @@ services:
       options:
         max-file: 5
         max-size: 10m
+```
