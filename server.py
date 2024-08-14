@@ -83,12 +83,16 @@ def update_dns():
                                 break
                     #print(f"VM Name: {vm['name']}, VM IP: {vm_ip}")
                     domain = vm['name'].split('-')[0]+".lc"
-                    
                     server_info = { "domain": domain.lower(), "ip": vm_ip }
                     domains.append(server_info)
                 except ResourceException as e:
-                    if "QEMU guest agent is not running" not in str(e) and "No QEMU guest agent configured" not in str(e):
+                    if "QEMU guest agent is not running" in str(e) and "No QEMU guest agent configured" in str(e):
+                        domain = vm['name'].split('-')[0]+".lc"
+                        server_info = { "domain": domain.lower(), "ip": "0.0.0.0" }
+                        domains.append(server_info)
+                    else:
                         print(f"Failed to get IP for VM {vm['name']}: {e}", flush=True)
+                    
             #else:
             #    print(f"VM Name: {vm['name']} is not running, skipping.")
     return(domains)
