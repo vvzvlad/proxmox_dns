@@ -5,8 +5,8 @@ services:
     image: vvzvlad/dns_proxy:latest
     container_name: proxdns
     ports:
-      - "53:5354/tcp"
-      - "53:5354/udp"
+      - "53:53/tcp"
+      - "53:53/udp"
     environment:
       - HOST=proxmox.lc 
       - USER=proxmoxdns@pve
