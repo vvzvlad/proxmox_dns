@@ -52,7 +52,7 @@ def start_dns_server(port=5354):
     server_address = ('0.0.0.0', port)
     sock.bind(server_address)
 
-    print(f"Proxmox DNS proxy run on port {port}...")
+    print(f"Proxmox DNS proxy run on port {port}...", flush=True))
 
     while True:
         data, addr = sock.recvfrom(512) 
@@ -88,7 +88,7 @@ def update_dns():
                     domains.append(server_info)
                 except ResourceException as e:
                     if "QEMU guest agent is not running" not in str(e) and "No QEMU guest agent configured" not in str(e):
-                        print(f"Failed to get IP for VM {vm['name']}: {e}")
+                        print(f"Failed to get IP for VM {vm['name']}: {e}", flush=True))
             #else:
             #    print(f"VM Name: {vm['name']} is not running, skipping.")
     return(domains)
@@ -98,7 +98,7 @@ def update_servers_periodically():
         domains = update_dns()
         servers_list.clear()
         servers_list.extend(domains)
-        print(f"Updated DNS servers list with {len(domains)} servers")
+        print(f"Updated DNS servers list with {len(domains)} servers", flush=True))
         time.sleep(3)    
 
 
