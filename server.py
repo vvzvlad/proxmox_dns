@@ -37,7 +37,7 @@ def handle_dns_query(data, addr):
             print(f"Return {server['ip']}", flush=True)
             response = dns.message.make_response(request)
             response.set_rcode(dns.rcode.NOERROR)
-            rrset = dns.rrset.from_text(qname, 10, dns.rdataclass.IN, dns.rdatatype.A, server['ip'])
+            rrset = dns.rrset.from_text(qname, 0, dns.rdataclass.IN, dns.rdatatype.A, server['ip'])
             response.answer.append(rrset)
             return response.to_wire()
 
