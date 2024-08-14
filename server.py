@@ -109,8 +109,7 @@ dns_thread = threading.Thread(target=start_dns_server, daemon=True)
 dns_thread.start()
 
 time.sleep(5)
-#print(json.dumps(servers_list))
-#
+
 while True:
     print(json.dumps(servers_list))
     time.sleep(600)
