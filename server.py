@@ -47,7 +47,7 @@ def handle_dns_query(data, addr):
     return response.to_wire()
 
 
-def start_dns_server(port=5354):
+def start_dns_server(port=53):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     server_address = ('0.0.0.0', port)
     sock.bind(server_address)
