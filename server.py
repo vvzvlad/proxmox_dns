@@ -8,6 +8,8 @@ import socket
 import os
 import json
 from zeroconf import ServiceBrowser, Zeroconf
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
 import traceback
 import socket
 import struct
@@ -18,7 +20,6 @@ from requests.packages.urllib3.exceptions import InsecureRequestWarning
 from proxmoxer.core import ResourceException  
 
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
-
 servers_list = []
 
 user = os.environ.get('USER')
@@ -31,6 +32,25 @@ raw_print = print
 def print(*args, **kwargs):
     if logging is not None:
         raw_print(*args, **kwargs)
+
+class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == '/':
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            formatted_list = [{"domain": server['domain'], "ip": server['ip']} for server in servers_list]
+            self.wfile.write(json.dumps(formatted_list).encode('utf-8'))
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+def start_http_server():
+    server_address = ('', 80) 
+    httpd = ThreadingHTTPServer(server_address, SimpleHTTPRequestHandler)
+    raw_print("HTTP server started on port 80...", flush=True)
+    httpd.serve_forever()
+
 def handle_dns_query(data, addr):
     request = dns.message.from_wire(data)
     qname = request.question[0].name.to_text()
@@ -57,7 +77,7 @@ def start_dns_server(port=53):
     server_address = ('0.0.0.0', port)
     sock.bind(server_address)
 
-    print(f"Proxmox DNS proxy run on port {port}...", flush=True)
+    raw_print(f"DNS server run on port {port}...", flush=True)
 
     while True:
         data, addr = sock.recvfrom(512) 
@@ -127,7 +147,12 @@ update_thread.start()
 dns_thread = threading.Thread(target=start_dns_server, daemon=True)
 dns_thread.start()
 
+http_thread = threading.Thread(target=start_http_server, daemon=True)
+http_thread.start()
+
+raw_print(f"Proxmox DNS server run", flush=True)
 
 while True:
     time.sleep(30)
-    print(json.dumps(servers_list))
+    formatted_list = ", ".join([f"{server['domain']}:{server['ip']}" for server in servers_list])
+    print(f"Servers: {formatted_list}", flush=True)
