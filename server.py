@@ -26,6 +26,7 @@ user = os.environ.get('USER')
 password = os.environ.get('PASSWORD')
 host = os.environ.get('HOST')
 logging = os.environ.get('LOGGING')
+subdomains = os.environ.get('SUBDOMAINS')
 proxmox = ProxmoxAPI(host, user=user, password=password, verify_ssl=False, service='PVE')
 
 raw_print = print
@@ -35,15 +36,25 @@ def print(*args, **kwargs):
 
 class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path == '/':
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
+        try:
+            if self.path == '/':
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                svrlist = [{"domain": server['domain'], "ip": server['ip']} for server in servers_list]
+                self.wfile.write(json.dumps(svrlist).encode('utf-8'))
+            else:
+                self.send_response(404)
+                self.end_headers()
+        except UnicodeDecodeError:
+            print("Received malformed request with encoding issues", flush=True)
+            self.send_response(400)
             self.end_headers()
-            formatted_list = [{"domain": server['domain'], "ip": server['ip']} for server in servers_list]
-            self.wfile.write(json.dumps(formatted_list).encode('utf-8'))
-        else:
-            self.send_response(404)
-            self.end_headers()
+
+    def log_message(self, fmt, *args):
+        raw_print("%s - - [%s] %s\n" % (self.client_address[0],
+                                        self.log_date_time_string(),
+                                        fmt % args), flush=True)
 
 def start_http_server():
     server_address = ('', 80) 
@@ -58,7 +69,7 @@ def handle_dns_query(data, addr):
     print(f"[DNS-Server] DNS query from {addr[0]} for '{dns_name}': ", end='', flush=True)
 
     for server in servers_list:
-        if dns_name == server['domain']:
+        if dns_name == server['domain'] or (subdomains is not None and dns_name.endswith(f".{server['domain']}")):
             print(f"Return {server['ip']}", flush=True)
             response = dns.message.make_response(request)
             response.set_rcode(dns.rcode.NOERROR)
