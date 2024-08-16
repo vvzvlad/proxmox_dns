@@ -103,12 +103,22 @@ def update_dns():
     return(domains)
 
 def update_servers_periodically():
+    previous_count = 0
+    last_change_time = None
+
     while True:
         domains = update_dns()
         servers_list.clear()
         servers_list.extend(domains)
         print(f"Updated DNS servers list with {len(domains)} servers", flush=True)
-        time.sleep(3)    
+
+        if len(domains) != previous_count: last_change_time = time.time()
+        if last_change_time and time.time() - last_change_time < 60:
+            time.sleep(1)
+        else:
+            time.sleep(5)
+        previous_count = len(domains)
+
 
 
 update_thread = threading.Thread(target=update_servers_periodically, daemon=True)
