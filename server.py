@@ -84,43 +84,52 @@ def start_dns_server(port=53):
         response = handle_dns_query(data, addr)
         sock.sendto(response, addr)
 
-
-
 def update_dns():
     domains = []
-    for node in proxmox.nodes.get():
-        for vm in proxmox.nodes(node['node']).qemu.get():
-            vm_status = proxmox.nodes(node['node']).qemu(vm['vmid']).status.current.get()
-            if vm_status['status'] == 'running':
-                try:
-                    network_status = proxmox.nodes(node['node']).qemu(vm['vmid']).agent('network-get-interfaces').get()
-                    vm_ip = None
-                    if 'result' in network_status:
-                        for interface in network_status['result']:
-                            if interface['name'] == 'lo': 
-                                continue
-                            for ip in interface.get('ip-addresses', []):
-                                ip_address = ip['ip-address']
-                                if ip_address.count('.') == 3 and (ip_address.startswith('10.31.40') or ip_address.startswith('10.31.41')):
-                                    vm_ip = ip_address
+    try:
+        nodes = proxmox.nodes.get() 
+    except requests.exceptions.ConnectionError as e:
+        print(f"Failed to connect to Proxmox: {e}", flush=True)
+        return None 
+
+    for node in nodes:
+        try:
+            for vm in proxmox.nodes(node['node']).qemu.get():
+                vm_status = proxmox.nodes(node['node']).qemu(vm['vmid']).status.current.get()
+                if vm_status['status'] == 'running':
+                    try:
+                        network_status = proxmox.nodes(node['node']).qemu(vm['vmid']).agent('network-get-interfaces').get()
+                        vm_ip = None
+                        if 'result' in network_status:
+                            for interface in network_status['result']:
+                                if interface['name'] == 'lo': 
+                                    continue
+                                for ip in interface.get('ip-addresses', []):
+                                    ip_address = ip['ip-address']
+                                    if ip_address.count('.') == 3 and (ip_address.startswith('10.31.40') or ip_address.startswith('10.31.41')):
+                                        vm_ip = ip_address
+                                        break
+                                if vm_ip:
                                     break
-                            if vm_ip:
-                                break
-                    #print(f"VM Name: {vm['name']}, VM IP: {vm_ip}")
-                    domain = vm['name'].split('-')[0]+".lc"
-                    domains.append({ "domain": domain.lower(), "ip": vm_ip })
-                except ResourceException as e:
+                        domain = vm['name'].split('-')[0]+".lc"
+                        domains.append({ "domain": domain.lower(), "ip": vm_ip })
+                    except ResourceException as e:
+                        domain = vm['name'].split('-')[0]+".lc"
+                        domains.append({ "domain": domain.lower(), "ip": "0.0.0.0" })
+                        if "QEMU guest agent is not running" not in str(e) and "No QEMU guest agent configured" not in str(e):
+                            print(f"Failed to get IP for VM {vm['name']}: {e}", flush=True)
+                    except Exception as e:
+                        domain = vm['name'].split('-')[0]+".lc"
+                        domains.append({ "domain": domain.lower(), "ip": "0.0.0.0" })
+                else:
                     domain = vm['name'].split('-')[0]+".lc"
                     domains.append({ "domain": domain.lower(), "ip": "0.0.0.0" })
-                    if "QEMU guest agent is not running" not in str(e) and "No QEMU guest agent configured" not in str(e):
-                        print(f"Failed to get IP for VM {vm['name']}: {e}", flush=True)
-                except Exception as e:
-                    domain = vm['name'].split('-')[0]+".lc"
-                    domains.append({ "domain": domain.lower(), "ip": "0.0.0.0" })
-            else:
-                domain = vm['name'].split('-')[0]+".lc"
-                domains.append({ "domain": domain.lower(), "ip": "0.0.0.0" })
-    return(domains)
+        except Exception as e:
+            print(f"Failed to retrieve VM list for node {node['node']}: {e}", flush=True)
+            continue
+
+    return domains
+
 
 def update_servers_periodically():
     previous_count = 0
@@ -128,6 +137,9 @@ def update_servers_periodically():
 
     while True:
         domains = update_dns()
+        if domains is None:
+            time.sleep(2)
+            continue
         servers_list.clear()
         servers_list.extend(domains)
         print(f"Updated DNS servers list with {len(domains)} servers", flush=True)
