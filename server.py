@@ -19,13 +19,18 @@ from proxmoxer.core import ResourceException
 
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
+servers_list = []
 
 user = os.environ.get('USER')
 password = os.environ.get('PASSWORD')
 host = os.environ.get('HOST')
+logging = os.environ.get('LOGGING')
 proxmox = ProxmoxAPI(host, user=user, password=password, verify_ssl=False, service='PVE')
 
-servers_list = []
+raw_print = print
+def print(*args, **kwargs):
+    if logging is not None:
+        raw_print(*args, **kwargs)
 def handle_dns_query(data, addr):
     request = dns.message.from_wire(data)
     qname = request.question[0].name.to_text()
