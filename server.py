@@ -106,6 +106,8 @@ def update_dns():
     for node in nodes:
         try:
             for vm in proxmox.nodes(node['node']).qemu.get():
+                if vm.get('template', 0) == 1:
+                    continue
                 vm_status = proxmox.nodes(node['node']).qemu(vm['vmid']).status.current.get()
                 if vm_status['status'] == 'running':
                     try:
