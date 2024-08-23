@@ -6,6 +6,7 @@ import dns.message
 import dns.query
 import socket
 import os
+import sys
 import json
 from zeroconf import ServiceBrowser, Zeroconf
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -41,20 +42,26 @@ class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
                 self.send_response(200)
                 self.send_header('Content-type', 'application/json')
                 self.end_headers()
-                svrlist = [{"domain": server['domain'], "ip": server['ip']} for server in servers_list]
+                
+                svrlist = [  { "domain": server['domain'],  "ipv4": server.get('ipv4'),   "ipv6": server.get('ipv6')   } 
+                    for server in servers_list
+                ]
+                
                 self.wfile.write(json.dumps(svrlist).encode('utf-8'))
             else:
                 self.send_response(404)
                 self.end_headers()
         except UnicodeDecodeError:
-            print("[HTTP] Received malformed request with encoding issues", flush=True)
+            self.log_error("[HTTP] Received malformed request with encoding issues")
             self.send_response(400)
+            self.end_headers()
+        except Exception as e:
+            self.log_error("[HTTP] Internal server error: %s", str(e))
+            self.send_response(500)
             self.end_headers()
 
     def log_message(self, fmt, *args):
-        raw_print("%s - - [%s] %s\n" % (self.client_address[0],
-                                        self.log_date_time_string(),
-                                        fmt % args), flush=True)
+        sys.stderr.write("%s - - [%s] %s\n" % (self.client_address[0], self.log_date_time_string(), fmt % args))
 
 def start_http_server():
     server_address = ('', 80) 
