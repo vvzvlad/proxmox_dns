@@ -47,7 +47,7 @@ class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
                 self.send_response(404)
                 self.end_headers()
         except UnicodeDecodeError:
-            print("Received malformed request with encoding issues", flush=True)
+            print("[HTTP] Received malformed request with encoding issues", flush=True)
             self.send_response(400)
             self.end_headers()
 
@@ -59,22 +59,31 @@ class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
 def start_http_server():
     server_address = ('', 80) 
     httpd = ThreadingHTTPServer(server_address, SimpleHTTPRequestHandler)
-    raw_print("HTTP server started on port 80...", flush=True)
+    raw_print("[HTTP] Server started on port 80...", flush=True)
     httpd.serve_forever()
 
 def handle_dns_query(data, addr):
     request = dns.message.from_wire(data)
     qname = request.question[0].name.to_text()
     dns_name = qname.lower().strip(".")
-    print(f"[DNS-Server] DNS query from {addr[0]} for '{dns_name}': ", end='', flush=True)
+    print(f"[DNS] DNS query from {addr[0]} for '{dns_name}': ", end='', flush=True)
 
     for server in servers_list:
         if dns_name == server['domain'] or (subdomains is not None and dns_name.endswith(f".{server['domain']}")):
-            print(f"Return {server['ip']}", flush=True)
             response = dns.message.make_response(request)
             response.set_rcode(dns.rcode.NOERROR)
-            rrset = dns.rrset.from_text(qname, 0, dns.rdataclass.IN, dns.rdatatype.A, server['ip'])
-            response.answer.append(rrset)
+            response.flags |= dns.flags.AA 
+
+            for question in request.question:
+                if question.rdtype == dns.rdatatype.A and 'ipv4' in server:
+                    print(f"Return A record: {server['ipv4']}", flush=True)
+                    rrset = dns.rrset.from_text(qname, 0, dns.rdataclass.IN, dns.rdatatype.A, server['ipv4'])
+                    response.answer.append(rrset)
+                elif question.rdtype == dns.rdatatype.AAAA and 'ipv6' in server:
+                    print(f"Return AAAA record: {server['ipv6']}", flush=True)
+                    rrset = dns.rrset.from_text(qname, 0, dns.rdataclass.IN, dns.rdatatype.AAAA, server['ipv6'])
+                    response.answer.append(rrset)
+
             return response.to_wire()
 
     response = dns.message.make_response(request)
@@ -83,101 +92,126 @@ def handle_dns_query(data, addr):
     return response.to_wire()
 
 
-def start_dns_server(port=53):
+
+
+def start_dns_server(port=53, address='0.0.0.0'):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    server_address = ('0.0.0.0', port)
+    server_address = (address, port)
     sock.bind(server_address)
 
-    raw_print(f"DNS server run on port {port}...", flush=True)
+    raw_print(f"[DNS] Server run on port {port}/udp on {address}...", flush=True)
 
     while True:
         data, addr = sock.recvfrom(512) 
         response = handle_dns_query(data, addr)
         sock.sendto(response, addr)
+def get_vm_ip(proxmox, node, vm):
+    domain = (vm['name'].split('-')[0]+".lc").lower()
+    def_ip_v4 = "00.00.00.00"
+    def_ip_v6 = "::"
+    try:
+        vm_status = proxmox.nodes(node['node']).qemu(vm['vmid']).status.current.get()
+        if vm_status['status'] != 'running':  return {"domain": domain, "ipv4": def_ip_v4, "ipv6": def_ip_v6}
+        
+        network_status = proxmox.nodes(node['node']).qemu(vm['vmid']).agent('network-get-interfaces').get()
+        vm_ip_v4 = None
+        vm_ip_v6 = None
+        
+        if 'result' in network_status:
+            for interface in network_status['result']:
+                if interface['name'].startswith(('lo', 'br-', 'veth', 'docker')):  continue
+                for ip in interface.get('ip-addresses', []):
+                    if ip['ip-address-type'] == 'ipv4' and not vm_ip_v4: vm_ip_v4 = ip['ip-address']
+                    elif ip['ip-address-type'] == 'ipv6' and not vm_ip_v6: vm_ip_v6 = ip['ip-address']
+                if vm_ip_v4 and vm_ip_v6:
+                    break
+        return { "domain": domain,  "ipv4": vm_ip_v4 or def_ip_v4,  "ipv6": vm_ip_v6 or def_ip_v6 }
+    
+    except ResourceException:
+        return {"domain": domain, "ipv4": def_ip_v4, "ipv6": def_ip_v6}
+    except Exception:
+        return {"domain": domain, "ipv4": def_ip_v4, "ipv6": def_ip_v6}
 
-def update_dns():
+def get_domains():
     domains = []
     try:
-        nodes = proxmox.nodes.get() 
+        nodes = proxmox.nodes.get()
     except requests.exceptions.ConnectionError as e:
-        print(f"Failed to connect to Proxmox: {e}", flush=True)
+        print(f"[Proxmox] Failed to connect to api: {e}", flush=True)
         return None 
-
+    
     for node in nodes:
         try:
-            for vm in proxmox.nodes(node['node']).qemu.get():
-                if vm.get('template', 0) == 1:
+            vms = proxmox.nodes(node['node']).qemu.get()
+            for vm in vms:
+                if vm.get('template', 0) == 1: 
                     continue
-                vm_status = proxmox.nodes(node['node']).qemu(vm['vmid']).status.current.get()
-                if vm_status['status'] == 'running':
-                    try:
-                        network_status = proxmox.nodes(node['node']).qemu(vm['vmid']).agent('network-get-interfaces').get()
-                        vm_ip = None
-                        if 'result' in network_status:
-                            for interface in network_status['result']:
-                                if interface['name'] == 'lo': 
-                                    continue
-                                for ip in interface.get('ip-addresses', []):
-                                    ip_address = ip['ip-address']
-                                    if ip_address.count('.') == 3 and (ip_address.startswith('10.31.40') or ip_address.startswith('10.31.41')):
-                                        vm_ip = ip_address
-                                        break
-                                if vm_ip:
-                                    break
-                        domain = vm['name'].split('-')[0]+".lc"
-                        domains.append({ "domain": domain.lower(), "ip": vm_ip })
-                    except ResourceException as e:
-                        domain = vm['name'].split('-')[0]+".lc"
-                        domains.append({ "domain": domain.lower(), "ip": "0.0.0.0" })
-                        if "QEMU guest agent is not running" not in str(e) and "No QEMU guest agent configured" not in str(e):
-                            print(f"Failed to get IP for VM {vm['name']}: {e}", flush=True)
-                    except Exception as e:
-                        domain = vm['name'].split('-')[0]+".lc"
-                        domains.append({ "domain": domain.lower(), "ip": "0.0.0.0" })
-                else:
-                    domain = vm['name'].split('-')[0]+".lc"
-                    domains.append({ "domain": domain.lower(), "ip": "0.0.0.0" })
+                
+                vm_info = get_vm_ip(proxmox, node, vm)
+                domains.append(vm_info)
+                
+                print(f"[Proxmox] Got IPv4 {vm_info['ipv4']} and IPv6 {vm_info['ipv6']} for domain {vm_info['domain']}", flush=True)
+        
         except Exception as e:
-            print(f"Failed to retrieve VM list for node {node['node']}: {e}", flush=True)
+            print(f"[Proxmox] Failed to retrieve VM list for node {node['node']}: {e}", flush=True)
             continue
-
+    
     return domains
 
 
-def update_servers_periodically():
+def update_dns_periodically():
+    sleep_low = 1
+    sleep_max = 5
+    sleep_delay = sleep_max
     previous_count = 0
     last_change_time = None
 
     while True:
-        domains = update_dns()
-        if domains is None:
-            time.sleep(2)
+        time.sleep(sleep_delay)
+        domains = get_domains()
+        if domains is None: 
+            print(f"[Proxmox] Failed to update DNS servers list, left previous list", flush=True)
             continue
         servers_list.clear()
         servers_list.extend(domains)
-        print(f"Updated DNS servers list with {len(domains)} servers", flush=True)
+        print(f"[Proxmox] Updated DNS servers list with {len(domains)} servers(period {sleep_delay})", flush=True)
 
         if len(domains) != previous_count: last_change_time = time.time()
-        if last_change_time and time.time() - last_change_time < 60:
-            time.sleep(1)
-        else:
-            time.sleep(5)
         previous_count = len(domains)
 
+        if last_change_time and time.time() - last_change_time < 60: sleep_delay = sleep_max
+        else: sleep_delay = sleep_low
+
+        
+        
 
 
-update_thread = threading.Thread(target=update_servers_periodically, daemon=True)
-update_thread.start()
+def main():
+    servers_list.extend(get_domains())
 
-dns_thread = threading.Thread(target=start_dns_server, daemon=True)
-dns_thread.start()
+    update_dns_thread = threading.Thread(target=update_dns_periodically, daemon=True)
+    update_dns_thread.start()
 
-http_thread = threading.Thread(target=start_http_server, daemon=True)
-http_thread.start()
+    dns_serve_thread = threading.Thread(target=start_dns_server, daemon=True)
+    dns_serve_thread.start()
 
-raw_print(f"Proxmox DNS server run", flush=True)
+    http_serve_thread = threading.Thread(target=start_http_server, daemon=True)
+    http_serve_thread.start()
 
-while True:
-    time.sleep(30)
-    formatted_list = ", ".join([f"{server['domain']}:{server['ip']}" for server in servers_list])
-    print(f"Servers: {formatted_list}", flush=True)
+    raw_print(f"ProxDNS server started", flush=True)
+
+    while True:
+        time.sleep(30)
+        max_domain_length = max(len(server['domain']) for server in servers_list)
+        max_ipv4_length = max(len(server.get('ipv4', '')) for server in servers_list)
+        max_ipv6_length = max(len(server.get('ipv6', '')) for server in servers_list)
+        for server in servers_list:
+            domain = server['domain'].ljust(max_domain_length)
+            ipv4_address = server.get('ipv4', '--.--.--.--').ljust(max_ipv4_length)
+            ipv6_address = server.get('ipv6', '--').ljust(max_ipv6_length)
+
+            print(f"{domain}\t{ipv4_address}\t{ipv6_address}", flush=True)
+
+
+if __name__ == "__main__":
+    main()
