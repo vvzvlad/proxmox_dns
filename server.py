@@ -91,6 +91,13 @@ def handle_dns_query(data, addr):
                     print(f"Return AAAA record: {server['ipv6']}", flush=True)
                     rrset = dns.rrset.from_text(qname, ttl, dns.rdataclass.IN, dns.rdatatype.AAAA, server['ipv6'])
                     response.answer.append(rrset)
+                elif question.rdtype == dns.rdatatype.PTR:
+                    for srv in servers_list:
+                        if srv.get('ipv4') == dns_name or srv.get('ipv6') == dns_name:
+                            print(f"Return PTR record: {srv['domain']}", flush=True)
+                            rrset = dns.rrset.from_text(qname, ttl, dns.rdataclass.IN, dns.rdatatype.PTR, srv['domain'])
+                            response.answer.append(rrset)
+                            break
 
             return response.to_wire()
 
