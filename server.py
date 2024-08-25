@@ -199,14 +199,17 @@ def update_dns_periodically():
 def main():
     servers_list.extend(get_domains())
 
-    update_dns_thread = threading.Thread(target=update_dns_periodically, daemon=True)
-    update_dns_thread.start()
+    def start_thread(target):
+        while True:
+            try:
+                target()
+            except Exception as e:
+                print(f"[Thread] Error in {target.__name__}: {e}", flush=True)
+                time.sleep(1)  # Wait a bit before restarting
 
-    dns_serve_thread = threading.Thread(target=start_dns_server, daemon=True)
-    dns_serve_thread.start()
-
-    http_serve_thread = threading.Thread(target=start_http_server, daemon=True)
-    http_serve_thread.start()
+    threading.Thread(target=lambda: start_thread(update_dns_periodically), daemon=True).start()
+    threading.Thread(target=lambda: start_thread(start_dns_server), daemon=True).start()
+    threading.Thread(target=lambda: start_thread(start_http_server), daemon=True).start()
 
     raw_print(f"ProxDNS server started", flush=True)
 
