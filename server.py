@@ -64,7 +64,7 @@ class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
 def start_http_server():
     server_address = ('', 80) 
     httpd = ThreadingHTTPServer(server_address, SimpleHTTPRequestHandler)
-    log_print("[HTTP] Server started on port 80...", flush=True)
+    print("[HTTP] Server started on port 80...", flush=True)
     httpd.serve_forever()
 
 def handle_dns_query(data, addr):
@@ -72,7 +72,7 @@ def handle_dns_query(data, addr):
     qname = request.question[0].name.to_text()
     dns_name = qname.lower().strip(".")
     ttl = 1
-    print(f"[DNS] DNS query from {addr[0]} for '{dns_name}': ", end='', flush=True)
+    log_print(f"[DNS] DNS query from {addr[0]} for '{dns_name}': ", end='', flush=True)
 
     for server in servers_list:
         if dns_name == server['domain'] or (subdomains is not None and dns_name.endswith(f".{server['domain']}")):
@@ -82,17 +82,17 @@ def handle_dns_query(data, addr):
 
             for question in request.question:
                 if question.rdtype == dns.rdatatype.A and 'ipv4' in server:
-                    print(f"Return A record: {server['ipv4']}", flush=True)
+                    log_print(f"Return A record: {server['ipv4']}", flush=True)
                     rrset = dns.rrset.from_text(qname, ttl, dns.rdataclass.IN, dns.rdatatype.A, server['ipv4'])
                     response.answer.append(rrset)
                 elif question.rdtype == dns.rdatatype.AAAA and 'ipv6' in server:
-                    print(f"Return AAAA record: {server['ipv6']}", flush=True)
+                    log_print(f"Return AAAA record: {server['ipv6']}", flush=True)
                     rrset = dns.rrset.from_text(qname, ttl, dns.rdataclass.IN, dns.rdatatype.AAAA, server['ipv6'])
                     response.answer.append(rrset)
                 elif question.rdtype == dns.rdatatype.PTR:
                     for srv in servers_list:
                         if srv.get('ipv4') == dns_name or srv.get('ipv6') == dns_name:
-                            print(f"Return PTR record: {srv['domain']}", flush=True)
+                            log_print(f"Return PTR record: {srv['domain']}", flush=True)
                             rrset = dns.rrset.from_text(qname, ttl, dns.rdataclass.IN, dns.rdatatype.PTR, srv['domain'])
                             response.answer.append(rrset)
                             break
@@ -101,7 +101,7 @@ def handle_dns_query(data, addr):
 
     response = dns.message.make_response(request)
     response.set_rcode(dns.rcode.NXDOMAIN)
-    print(f"Return NXDOMAIN", flush=True)
+    log_print(f"Return NXDOMAIN", flush=True)
     return response.to_wire()
 
 
@@ -118,7 +118,7 @@ def start_dns_server(port=53, address='0.0.0.0'):
             response = handle_dns_query(data, addr)
             sock.sendto(response, addr)
         except Exception as e:
-            print(f"[DNS] Error handling request: {e}", flush=True)
+            log_print(f"[DNS] Error handling request: {e}", flush=True)
 
 def get_vm_ip(proxmox, node, vm):
     domain = (vm['name'].split('-')[0]+".lc").lower()
@@ -152,7 +152,7 @@ def get_domains():
     try:
         nodes = proxmox.nodes.get()
     except requests.exceptions.ConnectionError as e:
-        print(f"[Proxmox] Failed to connect to api: {e}", flush=True)
+        log_print(f"[Proxmox] Failed to connect to api: {e}", flush=True)
         return None 
     
     for node in nodes:
@@ -165,10 +165,10 @@ def get_domains():
                 vm_info = get_vm_ip(proxmox, node, vm)
                 domains.append(vm_info)
                 
-                print(f"[Proxmox] Got IPv4 {vm_info['ipv4']} and IPv6 {vm_info['ipv6']} for domain {vm_info['domain']}", flush=True)
+                log_print(f"[Proxmox] Got IPv4 {vm_info['ipv4']} and IPv6 {vm_info['ipv6']} for domain {vm_info['domain']}", flush=True)
         
         except Exception as e:
-            print(f"[Proxmox] Failed to retrieve VM list for node {node['node']}: {e}", flush=True)
+            log_print(f"[Proxmox] Failed to retrieve VM list for node {node['node']}: {e}", flush=True)
             continue
     
     return domains
@@ -185,11 +185,11 @@ def update_dns_periodically():
         time.sleep(sleep_delay)
         domains = get_domains()
         if domains is None: 
-            print(f"[Proxmox] Failed to update DNS servers list, left previous list", flush=True)
+            log_print(f"[Proxmox] Failed to update DNS servers list, left previous list", flush=True)
             continue
         servers_list.clear()
         servers_list.extend(domains)
-        print(f"[Proxmox] Updated DNS servers list with {len(domains)} servers(period {sleep_delay})", flush=True)
+        log_print(f"[Proxmox] Updated DNS servers list with {len(domains)} servers(period {sleep_delay})", flush=True)
 
         if len(domains) != previous_count: last_change_time = time.time()
         previous_count = len(domains)
@@ -209,14 +209,14 @@ def main():
             try:
                 target()
             except Exception as e:
-                print(f"[Thread] Error in {target.__name__}: {e}", flush=True)
+                log_print(f"[Thread] Error in {target.__name__}: {e}", flush=True)
                 time.sleep(1)
 
     threading.Thread(target=lambda: start_thread(update_dns_periodically), daemon=True).start()
     threading.Thread(target=lambda: start_thread(start_dns_server), daemon=True).start()
     threading.Thread(target=lambda: start_thread(start_http_server), daemon=True).start()
 
-    log_print(f"ProxDNS server started", flush=True)
+    print(f"ProxDNS server started", flush=True)
 
     while True:
         time.sleep(30)
@@ -228,7 +228,7 @@ def main():
             ipv4_address = server.get('ipv4', '--.--.--.--').ljust(max_ipv4_length)
             ipv6_address = server.get('ipv6', '--').ljust(max_ipv6_length)
 
-            print(f"{domain}\t{ipv4_address}\t{ipv6_address}", flush=True)
+            log_print(f"{domain}\t{ipv4_address}\t{ipv6_address}", flush=True)
 
 
 if __name__ == "__main__":
