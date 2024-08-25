@@ -1,21 +1,18 @@
 import json
 import os
 import socket
-import struct
 import sys
 import threading
 import time
-import traceback
 
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import dns.message
 import dns.query
 import dns.resolver
 import requests
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from proxmoxer import ProxmoxAPI
 from proxmoxer.core import ResourceException
 from requests.packages.urllib3.exceptions import InsecureRequestWarning
-from zeroconf import ServiceBrowser, Zeroconf
 
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 servers_list = []
@@ -209,7 +206,7 @@ def main():
                 target()
             except Exception as e:
                 print(f"[Thread] Error in {target.__name__}: {e}", flush=True)
-                time.sleep(1)  # Wait a bit before restarting
+                time.sleep(1)
 
     threading.Thread(target=lambda: start_thread(update_dns_periodically), daemon=True).start()
     threading.Thread(target=lambda: start_thread(start_dns_server), daemon=True).start()
