@@ -108,9 +108,12 @@ def start_dns_server(port=53, address='0.0.0.0'):
     raw_print(f"[DNS] Server run on port {port}/udp on {address}...", flush=True)
 
     while True:
-        data, addr = sock.recvfrom(512) 
-        response = handle_dns_query(data, addr)
-        sock.sendto(response, addr)
+        try:
+            data, addr = sock.recvfrom(512) 
+            response = handle_dns_query(data, addr)
+            sock.sendto(response, addr)
+        except Exception as e:
+            print(f"[DNS] Error handling request: {e}", flush=True)
 
 def get_vm_ip(proxmox, node, vm):
     domain = (vm['name'].split('-')[0]+".lc").lower()
