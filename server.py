@@ -40,7 +40,8 @@ class ColoredFormatter(logging.Formatter):
 
 def setup_logger():
     logger_t = logging.getLogger("mdns_proxy")
-    logger_t.setLevel(logging.INFO)
+    level = logging.getLevelName(logging_level.upper()) if logging_level else logging.INFO
+    logger_t.setLevel(level)
     console_handler = logging.StreamHandler()
     console_handler.setLevel(logging.INFO)
     colored_formatter = ColoredFormatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
