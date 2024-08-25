@@ -59,7 +59,7 @@ class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
 def start_http_server():
     server_address = ('', 80) 
     httpd = ThreadingHTTPServer(server_address, SimpleHTTPRequestHandler)
-    raw_print("[HTTP] Server started on port 80...", flush=True)
+    log_print("[HTTP] Server started on port 80...", flush=True)
     httpd.serve_forever()
 
 def handle_dns_query(data, addr):
@@ -105,7 +105,7 @@ def start_dns_server(port=53, address='0.0.0.0'):
     server_address = (address, port)
     sock.bind(server_address)
 
-    raw_print(f"[DNS] Server run on port {port}/udp on {address}...", flush=True)
+    log_print(f"[DNS] Server run on port {port}/udp on {address}...", flush=True)
 
     while True:
         try:
@@ -211,7 +211,7 @@ def main():
     threading.Thread(target=lambda: start_thread(start_dns_server), daemon=True).start()
     threading.Thread(target=lambda: start_thread(start_http_server), daemon=True).start()
 
-    raw_print(f"ProxDNS server started", flush=True)
+    log_print(f"ProxDNS server started", flush=True)
 
     while True:
         time.sleep(30)
