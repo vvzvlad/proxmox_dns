@@ -6,8 +6,8 @@ import sys
 import threading
 import time
 
-from colorama import Fore, Style, init
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from colorama import Fore, Style, init
 import dns.message
 import dns.query
 import dns.resolver
@@ -19,12 +19,13 @@ from requests.packages.urllib3.exceptions import InsecureRequestWarning
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 servers_list = []
 
-user = os.environ.get('USER')
-password = os.environ.get('PASSWORD')
-host = os.environ.get('HOST')
 logging_level = os.environ.get('LOGGING')
 subdomains = os.environ.get('SUBDOMAINS')
-proxmox = ProxmoxAPI(host, user=user, password=password, verify_ssl=False, service='PVE')
+
+proxmox = ProxmoxAPI(os.environ.get('HOST'),
+                    user=os.environ.get('USER'),
+                    password=os.environ.get('PASSWORD'),
+                    verify_ssl=False, service='PVE')
 
 init(autoreset=True)
 
