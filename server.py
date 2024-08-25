@@ -1,24 +1,21 @@
-import requests
-import threading
-import time
-import dns.resolver
-import dns.message
-import dns.query
-import socket
-import os
-import sys
 import json
-from zeroconf import ServiceBrowser, Zeroconf
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-
-import traceback
+import os
 import socket
 import struct
+import sys
+import threading
+import time
+import traceback
 
-from proxmoxer import ProxmoxAPI
+import dns.message
+import dns.query
+import dns.resolver
 import requests
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from proxmoxer import ProxmoxAPI
+from proxmoxer.core import ResourceException
 from requests.packages.urllib3.exceptions import InsecureRequestWarning
-from proxmoxer.core import ResourceException  
+from zeroconf import ServiceBrowser, Zeroconf
 
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 servers_list = []
