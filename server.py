@@ -22,7 +22,7 @@ servers_list = []
 user = os.environ.get('USER')
 password = os.environ.get('PASSWORD')
 host = os.environ.get('HOST')
-logging = os.environ.get('LOGGING')
+logging_level = os.environ.get('LOGGING')
 subdomains = os.environ.get('SUBDOMAINS')
 proxmox = ProxmoxAPI(host, user=user, password=password, verify_ssl=False, service='PVE')
 
