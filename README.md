@@ -96,5 +96,5 @@ The interval between updates is dynamically adjusted based on changes in the num
 
 ## Logging
 
-To enable logging, set the `LOGGING` environment variable to any value.  
-This will output log information about DNS queries, API calls, and other service activities.
+To configure logging, set the `LOGGING` environment variable to the desired logging level (e.g., DEBUG, INFO, WARNING, ERROR, CRITICAL).  
+This will control the verbosity of log information about DNS queries, API calls, and other service activities.
