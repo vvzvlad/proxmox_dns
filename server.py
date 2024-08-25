@@ -238,7 +238,7 @@ def main():
     threading.Thread(target=lambda: start_thread(start_dns_server), daemon=True).start()
     threading.Thread(target=lambda: start_thread(start_http_server), daemon=True).start()
 
-    logger.info(f"ProxDNS server started")
+    logger.log(logging.CRITICAL, "ProxDNS server started")
 
     while True:
         time.sleep(30)
