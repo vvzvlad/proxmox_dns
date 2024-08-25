@@ -82,7 +82,7 @@ class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def log_message(self, fmt, *args):
-        sys.stderr.write("%s - - [%s] %s\n" % (self.client_address[0], self.log_date_time_string(), fmt % args))
+        logger.debug(f"{self.client_address[0]} - - [{self.log_date_time_string()}] {fmt % args}")
 
 def start_http_server():
     server_address = ('', 80) 
