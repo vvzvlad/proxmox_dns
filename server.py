@@ -114,8 +114,15 @@ def handle_dns_query(data, addr):
                     rrset = dns.rrset.from_text(qname, ttl, dns.rdataclass.IN, dns.rdatatype.AAAA, server['ipv6'])
                     response.answer.append(rrset)
                 elif question.rdtype == dns.rdatatype.PTR:
+                    reversed_ip = dns_name.rstrip('.').split('.in-addr.arpa')[0].split('.')
+                    if len(reversed_ip) == 4:
+                        ip_address = '.'.join(reversed(reversed_ip))
+                    else:
+                        reversed_ip = dns_name.rstrip('.').split('.ip6.arpa')[0].split('.')
+                        ip_address = ':'.join(reversed(reversed_ip))
+
                     for srv in servers_list:
-                        if srv.get('ipv4') == dns_name or srv.get('ipv6') == dns_name:
+                        if srv.get('ipv4') == ip_address or srv.get('ipv6') == ip_address:
                             logger.info(f"[DNS] Return PTR record: {srv['domain']}")
                             rrset = dns.rrset.from_text(qname, ttl, dns.rdataclass.IN, dns.rdatatype.PTR, srv['domain'])
                             response.answer.append(rrset)
