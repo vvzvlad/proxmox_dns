@@ -73,22 +73,23 @@ def handle_dns_query(data, addr):
     request = dns.message.from_wire(data)
     qname = request.question[0].name.to_text()
     dns_name = qname.lower().strip(".")
+    ttl = 1
     print(f"[DNS] DNS query from {addr[0]} for '{dns_name}': ", end='', flush=True)
 
     for server in servers_list:
         if dns_name == server['domain'] or (subdomains is not None and dns_name.endswith(f".{server['domain']}")):
             response = dns.message.make_response(request)
             response.set_rcode(dns.rcode.NOERROR)
-            response.flags |= dns.flags.AA 
+            response.flags |= dns.flags.AA # Authoritative Answer
 
             for question in request.question:
                 if question.rdtype == dns.rdatatype.A and 'ipv4' in server:
                     print(f"Return A record: {server['ipv4']}", flush=True)
-                    rrset = dns.rrset.from_text(qname, 0, dns.rdataclass.IN, dns.rdatatype.A, server['ipv4'])
+                    rrset = dns.rrset.from_text(qname, ttl, dns.rdataclass.IN, dns.rdatatype.A, server['ipv4'])
                     response.answer.append(rrset)
                 elif question.rdtype == dns.rdatatype.AAAA and 'ipv6' in server:
                     print(f"Return AAAA record: {server['ipv6']}", flush=True)
-                    rrset = dns.rrset.from_text(qname, 0, dns.rdataclass.IN, dns.rdatatype.AAAA, server['ipv6'])
+                    rrset = dns.rrset.from_text(qname, ttl, dns.rdataclass.IN, dns.rdatatype.AAAA, server['ipv6'])
                     response.answer.append(rrset)
 
             return response.to_wire()
@@ -97,8 +98,6 @@ def handle_dns_query(data, addr):
     response.set_rcode(dns.rcode.NXDOMAIN)
     print(f"Return NXDOMAIN", flush=True)
     return response.to_wire()
-
-
 
 
 def start_dns_server(port=53, address='0.0.0.0'):
@@ -112,6 +111,7 @@ def start_dns_server(port=53, address='0.0.0.0'):
         data, addr = sock.recvfrom(512) 
         response = handle_dns_query(data, addr)
         sock.sendto(response, addr)
+
 def get_vm_ip(proxmox, node, vm):
     domain = (vm['name'].split('-')[0]+".lc").lower()
     def_ip_v4 = "00.00.00.00"
