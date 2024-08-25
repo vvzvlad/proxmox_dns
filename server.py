@@ -24,10 +24,9 @@ logging = os.environ.get('LOGGING')
 subdomains = os.environ.get('SUBDOMAINS')
 proxmox = ProxmoxAPI(host, user=user, password=password, verify_ssl=False, service='PVE')
 
-raw_print = print
-def print(*args, **kwargs):
+def log_print(*args, **kwargs):
     if logging is not None:
-        raw_print(*args, **kwargs)
+        print(*args, **kwargs)
 
 class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
