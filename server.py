@@ -114,7 +114,7 @@ def start_dns_server(port=53, address='0.0.0.0'):
 
 def get_vm_ip(proxmox, node, vm):
     domain = (vm['name'].split('-')[0]+".lc").lower()
-    def_ip_v4 = "00.00.00.00"
+    def_ip_v4 = "0.0.0.0"
     def_ip_v6 = "::"
     try:
         vm_status = proxmox.nodes(node['node']).qemu(vm['vmid']).status.current.get()
