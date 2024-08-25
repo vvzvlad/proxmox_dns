@@ -7,3 +7,4 @@ proxmoxer==2.1.0
 requests==2.31.0
 urllib3==2.2.1
 zeroconf==0.131.0
+colorama==0.4.6
