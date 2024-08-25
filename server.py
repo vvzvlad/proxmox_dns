@@ -32,26 +32,26 @@ class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         try:
             if self.path == '/':
-                self.send_response(200)
-                self.send_header('Content-type', 'application/json')
-                self.end_headers()
-                
-                svrlist = [  { "domain": server['domain'],  "ipv4": server.get('ipv4'),   "ipv6": server.get('ipv6')   } 
-                    for server in servers_list
-                ]
-                
-                self.wfile.write(json.dumps(svrlist).encode('utf-8'))
+                self._send_json_response(200, servers_list)
             else:
-                self.send_response(404)
-                self.end_headers()
+                self._send_response(404)
         except UnicodeDecodeError:
             self.log_error("[HTTP] Received malformed request with encoding issues")
-            self.send_response(400)
-            self.end_headers()
+            self._send_response(400)
         except Exception as e:
             self.log_error("[HTTP] Internal server error: %s", str(e))
-            self.send_response(500)
-            self.end_headers()
+            self._send_response(500)
+
+    def _send_json_response(self, status_code, data):
+        self.send_response(status_code)
+        self.send_header('Content-type', 'application/json')
+        self.end_headers()
+        svrlist = [{"domain": server['domain'], "ipv4": server.get('ipv4'), "ipv6": server.get('ipv6')} for server in data]
+        self.wfile.write(json.dumps(svrlist).encode('utf-8'))
+
+    def _send_response(self, status_code):
+        self.send_response(status_code)
+        self.end_headers()
 
     def log_message(self, fmt, *args):
         sys.stderr.write("%s - - [%s] %s\n" % (self.client_address[0], self.log_date_time_string(), fmt % args))
