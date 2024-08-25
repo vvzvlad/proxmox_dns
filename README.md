@@ -64,7 +64,7 @@ This section explains the purpose of each environment variable used in the ProxD
 - **HOST**: The address of the Proxmox server 
 - **USER**: The username used to access the Proxmox API. This user must have the necessary privileges to monitor and audit VMs.
 - **PASSWORD**: The password for the specified user to connect to the Proxmox API.
-- **LOGGING**: Enables verbose logging if this variable is set with any value (not necessarily `true`).
+- **LOGGING**: Set the logging level (e.g., DEBUG, INFO, WARNING, ERROR, CRITICAL).
 - **SUBDOMAINS**: If set with any value (not necessarily `true`), all subdomains of a VM will resolve to the same IP address as the main domain. For example, `sub.domain.com` will resolve to the same IP as `domain.com`.
 
 ## Proxmox Setup
