@@ -105,17 +105,17 @@ def handle_dns_query(data, addr):
 
             for question in request.question:
                 if question.rdtype == dns.rdatatype.A and 'ipv4' in server:
-                    logger.info(f"Return A record: {server['ipv4']}")
+                    logger.info(f"[DNS] Return A record: {server['ipv4']}")
                     rrset = dns.rrset.from_text(qname, ttl, dns.rdataclass.IN, dns.rdatatype.A, server['ipv4'])
                     response.answer.append(rrset)
                 elif question.rdtype == dns.rdatatype.AAAA and 'ipv6' in server:
-                    logger.info(f"Return AAAA record: {server['ipv6']}")
+                    logger.info(f"[DNS] Return AAAA record: {server['ipv6']}")
                     rrset = dns.rrset.from_text(qname, ttl, dns.rdataclass.IN, dns.rdatatype.AAAA, server['ipv6'])
                     response.answer.append(rrset)
                 elif question.rdtype == dns.rdatatype.PTR:
                     for srv in servers_list:
                         if srv.get('ipv4') == dns_name or srv.get('ipv6') == dns_name:
-                            logger.info(f"Return PTR record: {srv['domain']}")
+                            logger.info(f"[DNS] Return PTR record: {srv['domain']}")
                             rrset = dns.rrset.from_text(qname, ttl, dns.rdataclass.IN, dns.rdatatype.PTR, srv['domain'])
                             response.answer.append(rrset)
                             break
@@ -124,7 +124,7 @@ def handle_dns_query(data, addr):
 
     response = dns.message.make_response(request)
     response.set_rcode(dns.rcode.NXDOMAIN)
-    logger.info(f"Return NXDOMAIN")
+    logger.info(f"[DNS] Return NXDOMAIN")
     return response.to_wire()
 
 
@@ -188,7 +188,7 @@ def get_domains():
                 vm_info = get_vm_ip(proxmox, node, vm)
                 domains.append(vm_info)
                 
-                logger.info(f"[Proxmox] Got IPv4 {vm_info['ipv4']} and IPv6 {vm_info['ipv6']} for domain {vm_info['domain']}")
+                logger.debug(f"[Proxmox] Got IPv4 {vm_info['ipv4']} and IPv6 {vm_info['ipv6']} for domain {vm_info['domain']}")
         
         except Exception as e:
             logger.error(f"[Proxmox] Failed to retrieve VM list for node {node['node']}: {e}")
@@ -251,7 +251,7 @@ def main():
             ipv4_address = server.get('ipv4', '--.--.--.--').ljust(max_ipv4_length)
             ipv6_address = server.get('ipv6', '--').ljust(max_ipv6_length)
 
-            logger.info(f"{domain}\t{ipv4_address}\t{ipv6_address}")
+            logger.debug(f"{domain}\t{ipv4_address}\t{ipv6_address}")
 
 
 if __name__ == "__main__":
