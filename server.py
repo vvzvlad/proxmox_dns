@@ -32,7 +32,7 @@ class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         try:
             if self.path == '/':
-                self._send_json_response(200, servers_list)
+                self._send_html_table_response(200, servers_list)
             else:
                 self._send_response(404)
         except UnicodeDecodeError:
@@ -42,12 +42,17 @@ class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
             self.log_error("[HTTP] Internal server error: %s", str(e))
             self._send_response(500)
 
-    def _send_json_response(self, status_code, data):
+    def _send_html_table_response(self, status_code, data):
         self.send_response(status_code)
-        self.send_header('Content-type', 'application/json')
+        self.send_header('Content-type', 'text/html')
         self.end_headers()
-        svrlist = [{"domain": server['domain'], "ipv4": server.get('ipv4'), "ipv6": server.get('ipv6')} for server in data]
-        self.wfile.write(json.dumps(svrlist).encode('utf-8'))
+        table_header = "<tr><th>Domain</th><th>IPv4</th><th>IPv6</th></tr>"
+        table_rows = "".join(
+            f"<tr><td>{server['domain']}</td><td>{server.get('ipv4', '--.--.--.--')}</td><td>{server.get('ipv6', '--')}</td></tr>"
+            for server in data
+        )
+        html_content = f"<html><body><table border='1'>{table_header}{table_rows}</table></body></html>"
+        self.wfile.write(html_content.encode('utf-8'))
 
     def _send_response(self, status_code):
         self.send_response(status_code)
