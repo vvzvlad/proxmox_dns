@@ -98,13 +98,31 @@ def handle_dns_query(data, addr):
     ttl = 1
     logger.info(f"[DNS] DNS query from {addr[0]} for '{dns_name}': ")
 
-    for server in servers_list:
-        if dns_name == server['domain'] or (subdomains is not None and dns_name.endswith(f".{server['domain']}")):
-            response = dns.message.make_response(request)
-            response.set_rcode(dns.rcode.NOERROR)
-            response.flags |= dns.flags.AA # Authoritative Answer
+    for question in request.question:
+        if question.rdtype == dns.rdatatype.PTR:
+            reversed_ip = dns_name.rstrip('.').split('.in-addr.arpa')[0].split('.')
+            if len(reversed_ip) == 4:
+                ip_address = '.'.join(reversed(reversed_ip))
+            else:
+                reversed_ip = dns_name.rstrip('.').split('.ip6.arpa')[0].split('.')
+                ip_address = ':'.join(reversed(reversed_ip))
 
-            for question in request.question:
+            for srv in servers_list:
+                if srv.get('ipv4') == ip_address or srv.get('ipv6') == ip_address:
+                    logger.info(f"[DNS] Return PTR record: {srv['domain']}")
+                    response = dns.message.make_response(request)
+                    response.set_rcode(dns.rcode.NOERROR)
+                    response.flags |= dns.flags.AA
+                    rrset = dns.rrset.from_text(qname, ttl, dns.rdataclass.IN, dns.rdatatype.PTR, srv['domain'])
+                    response.answer.append(rrset)
+                    return response.to_wire()
+
+        for server in servers_list:
+            if dns_name == server['domain'] or (subdomains is not None and dns_name.endswith(f".{server['domain']}")):
+                response = dns.message.make_response(request)
+                response.set_rcode(dns.rcode.NOERROR)
+                response.flags |= dns.flags.AA
+
                 if question.rdtype == dns.rdatatype.A and 'ipv4' in server:
                     logger.info(f"[DNS] Return A record: {server['ipv4']}")
                     rrset = dns.rrset.from_text(qname, ttl, dns.rdataclass.IN, dns.rdatatype.A, server['ipv4'])
@@ -113,22 +131,8 @@ def handle_dns_query(data, addr):
                     logger.info(f"[DNS] Return AAAA record: {server['ipv6']}")
                     rrset = dns.rrset.from_text(qname, ttl, dns.rdataclass.IN, dns.rdatatype.AAAA, server['ipv6'])
                     response.answer.append(rrset)
-                elif question.rdtype == dns.rdatatype.PTR:
-                    reversed_ip = dns_name.rstrip('.').split('.in-addr.arpa')[0].split('.')
-                    if len(reversed_ip) == 4:
-                        ip_address = '.'.join(reversed(reversed_ip))
-                    else:
-                        reversed_ip = dns_name.rstrip('.').split('.ip6.arpa')[0].split('.')
-                        ip_address = ':'.join(reversed(reversed_ip))
 
-                    for srv in servers_list:
-                        if srv.get('ipv4') == ip_address or srv.get('ipv6') == ip_address:
-                            logger.info(f"[DNS] Return PTR record: {srv['domain']}")
-                            rrset = dns.rrset.from_text(qname, ttl, dns.rdataclass.IN, dns.rdatatype.PTR, srv['domain'])
-                            response.answer.append(rrset)
-                            break
-
-            return response.to_wire()
+                return response.to_wire()
 
     response = dns.message.make_response(request)
     response.set_rcode(dns.rcode.NXDOMAIN)
