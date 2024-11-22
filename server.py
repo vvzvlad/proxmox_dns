@@ -176,7 +176,8 @@ def get_vm_ip(proxmox, node, vm):
         
         if 'result' in network_status:
             for interface in network_status['result']:
-                if interface['name'].startswith(('lo', 'br-', 'veth', 'docker')):  continue
+                if interface['name'].startswith(('lo', 'br-', 'veth', 'docker', 'wg', 'tun')):  continue
+                if 'hardware-address' in interface and interface['hardware-address'] == '00:00:00:00:00:00': continue
                 for ip in interface.get('ip-addresses', []):
                     if ip['ip-address-type'] == 'ipv4' and not vm_ip_v4: vm_ip_v4 = ip['ip-address']
                     elif ip['ip-address-type'] == 'ipv6' and not vm_ip_v6: vm_ip_v6 = ip['ip-address']
