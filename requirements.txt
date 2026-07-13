@@ -2,3 +2,4 @@ dnspython==2.6.1
 proxmoxer==2.1.0
 requests==2.31.0
 colorama==0.4.6
+pydantic-settings==2.7.0

@@ -1,0 +1,35 @@
+# Deploy template. Pull the prebuilt image from ghcr.io — do NOT build on prod.
+# Values below are PLACEHOLDERS (XXX), not real secrets.
+#
+# ProxDNS is a DNS server: it publishes raw UDP :53 and an HTTP status page,
+# so it is exposed via direct port mapping (NOT via Traefik's HTTP router).
+# It is stateless -> no data volume is needed.
+
+services:
+  proxdns:
+    image: ghcr.io/vvzvlad/dns_proxy:latest
+    container_name: proxdns
+    restart: always
+    ports:
+      # DNS is served over UDP only (the server binds a UDP socket).
+      - "53:53/udp"
+      - "8076:80/tcp"        # HTTP status page: /, /json, /health
+    environment:
+      PROXMOX_HOST: XXX
+      PROXMOX_USER: XXX
+      PROXMOX_PASSWORD: XXX
+      LOG_LEVEL: INFO
+      SUBDOMAINS: "false"
+      TZ: Europe/Moscow
+    logging:
+      driver: "json-file"
+      options:
+        max-file: 5
+        max-size: 10m
+    labels:
+      com.centurylinklabs.watchtower.enable: "true"   # auto-update the image
+    healthcheck:
+      test: ["CMD", "curl", "-s", "-f", "-o", "/dev/null", "http://127.0.0.1:80/health"]
+      interval: 30m
+      timeout: 5s
+      retries: 2

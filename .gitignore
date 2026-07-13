@@ -1,2 +1,18 @@
-/.venv
+.env
+.venv/
+venv/
+ENV/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.swp
+.DS_Store
+logs/
 .aider*
+data/*
+!data/.gitkeep
+# Claude Code agent worktrees — never commit
+.claude/worktrees/
