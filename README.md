@@ -42,20 +42,19 @@ All config comes from the environment (see `.env.example`); read via
 - `templates/` — static assets baked into the image
 
 ## Docker / Deploy
-CI builds and pushes the image to `ghcr.io/vvzvlad/dns_proxy` (tests must pass
+CI builds and pushes the image to `ghcr.io/vvzvlad/proxmox_dns` (tests must pass
 first). On prod, pull the prebuilt image via docker-compose (see
 `docker-compose.yml`) — do not build on prod; `watchtower` auto-updates `latest`.
 
-ProxDNS publishes raw UDP/TCP `:53` and an HTTP status port, so it is exposed via
+ProxDNS publishes raw UDP `:53` and an HTTP status port, so it is exposed via
 direct port mapping (not Traefik). Example (placeholders only):
 ```yaml
 services:
   proxdns:
-    image: ghcr.io/vvzvlad/dns_proxy:latest
+    image: ghcr.io/vvzvlad/proxmox_dns:latest
     container_name: proxdns
     restart: always
     ports:
-      - "53:53/tcp"
       - "53:53/udp"
       - "8076:80/tcp"
     environment:

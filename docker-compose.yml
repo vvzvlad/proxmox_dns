@@ -7,7 +7,7 @@
 
 services:
   proxdns:
-    image: ghcr.io/vvzvlad/dns_proxy:latest
+    image: ghcr.io/vvzvlad/proxmox_dns:latest
     container_name: proxdns
     restart: always
     ports:
