@@ -1,11 +1,14 @@
+import ipaddress
 import logging
 import socket
 
+import dns.exception
 import dns.flags
 import dns.message
 import dns.rcode
 import dns.rdataclass
 import dns.rdatatype
+import dns.reversename
 import dns.rrset
 
 from src import state
@@ -22,22 +25,37 @@ def handle_dns_query(data, addr):
 
     for question in request.question:
         if question.rdtype == dns.rdatatype.PTR:
-            reversed_ip = dns_name.rstrip(".").split(".in-addr.arpa")[0].split(".")
-            if len(reversed_ip) == 4:
-                ip_address = ".".join(reversed(reversed_ip))
-            else:
-                reversed_ip = dns_name.rstrip(".").split(".ip6.arpa")[0].split(".")
-                ip_address = ":".join(reversed(reversed_ip))
+            # Convert the reverse-map name (in-addr.arpa / ip6.arpa) back to an IP.
+            # dnspython handles both IPv4 and IPv6 correctly; the previous manual
+            # nibble joining produced invalid IPv6 addresses that never matched.
+            try:
+                query_ip = ipaddress.ip_address(dns.reversename.to_address(question.name))
+            except (dns.exception.DNSException, ValueError):
+                query_ip = None
 
-            for srv in state.servers_list:
-                if srv.get("ipv4") == ip_address or srv.get("ipv6") == ip_address:
-                    logger.info(f"[DNS] Return PTR record: {srv['domain']}")
-                    response = dns.message.make_response(request)
-                    response.set_rcode(dns.rcode.NOERROR)
-                    response.flags |= dns.flags.AA
-                    rrset = dns.rrset.from_text(qname, ttl, dns.rdataclass.IN, dns.rdatatype.PTR, srv["domain"] + ".")
-                    response.answer.append(rrset)
-                    return response.to_wire()
+            # The unspecified address (0.0.0.0 / ::) is the sentinel stored for
+            # stopped or agent-less VMs; a PTR query for it must not match them.
+            if query_ip is not None and query_ip.is_unspecified:
+                query_ip = None
+
+            if query_ip is not None:
+                for srv in state.servers_list:
+                    # Match against the field of the right family; compare parsed IP
+                    # objects so compressed and exploded IPv6 forms are treated equal.
+                    srv_ip = srv.get("ipv4") if query_ip.version == 4 else srv.get("ipv6")
+                    if not srv_ip:
+                        continue
+                    try:
+                        if ipaddress.ip_address(srv_ip) == query_ip:
+                            logger.info(f"[DNS] Return PTR record: {srv['domain']}")
+                            response = dns.message.make_response(request)
+                            response.set_rcode(dns.rcode.NOERROR)
+                            response.flags |= dns.flags.AA
+                            rrset = dns.rrset.from_text(qname, ttl, dns.rdataclass.IN, dns.rdatatype.PTR, srv["domain"] + ".")
+                            response.answer.append(rrset)
+                            return response.to_wire()
+                    except ValueError:
+                        continue
 
         for server in state.servers_list:
             if dns_name == server["domain"] or (settings.subdomains and dns_name.endswith(f".{server['domain']}")):

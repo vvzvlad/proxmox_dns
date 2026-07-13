@@ -6,37 +6,45 @@ from src import state
 from src.dns_server import start_dns_server
 from src.http_server import start_http_server
 from src.logging_setup import logger
-from src.proxmox import build_client, get_domains
+from src.proxmox import build_client, get_domains, get_vm_inventory
 
 # The Proxmox client is created once in run() and shared with the updater thread.
 _proxmox = None
 
 
 def update_dns_periodically():
-    sleep_low = 1
-    sleep_max = 5
-    sleep_delay = sleep_max
-    previous_count = 0
-    last_change_time = None
+    detect_interval = 2          # seconds between cheap inventory checks
+    full_refresh_interval = 60   # seconds between unconditional full refreshes
+    last_signature = None
+    last_full_refresh = 0.0
 
     while True:
-        time.sleep(sleep_delay)
+        time.sleep(detect_interval)
+
+        signature = get_vm_inventory(_proxmox)
+        if signature is None:
+            # API unreachable: keep the previous list, retry on the next tick.
+            continue
+
+        changed = signature != last_signature
+        due_for_full = time.time() - last_full_refresh >= full_refresh_interval
+        if not (changed or due_for_full):
+            continue
+
         domains = get_domains(_proxmox)
         if domains is None:
-            logger.warning("[Proxmox] Failed to update DNS servers list, left previous list")
+            logger.warning("[Proxmox] Failed to update DNS servers list, kept previous list")
             continue
+
         state.servers_list.clear()
         state.servers_list.extend(domains)
-        logger.info(f"[Proxmox] Updated DNS servers list with {len(domains)} servers(period {sleep_delay})")
+        last_full_refresh = time.time()
 
-        if len(domains) != previous_count:
-            last_change_time = time.time()
-        previous_count = len(domains)
-
-        if last_change_time and time.time() - last_change_time < 60:
-            sleep_delay = sleep_max
-        else:
-            sleep_delay = sleep_low
+        # Log only on a real inventory change; the periodic refresh stays quiet.
+        # Skip the log on the very first refresh (last_signature is None at startup).
+        if changed and last_signature is not None:
+            logger.info(f"[Proxmox] VM inventory changed, refreshed {len(domains)} domains")
+        last_signature = signature
 
 
 def run():

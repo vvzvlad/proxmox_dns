@@ -25,8 +25,9 @@ def get_vm_ip(proxmox, node, vm):
     def_ip_v4 = "0.0.0.0"
     def_ip_v6 = "::"
     try:
-        vm_status = proxmox.nodes(node["node"]).qemu(vm["vmid"]).status.current.get()
-        if vm_status["status"] != "running":
+        # Run state already comes with the qemu list / cluster resources;
+        # no extra status.current call needed.
+        if vm.get("status") != "running":
             return {"domain": domain, "ipv4": def_ip_v4, "ipv6": def_ip_v6}
 
         network_status = proxmox.nodes(node["node"]).qemu(vm["vmid"]).agent("network-get-interfaces").get()
@@ -54,12 +55,41 @@ def get_vm_ip(proxmox, node, vm):
         return {"domain": domain, "ipv4": def_ip_v4, "ipv6": def_ip_v6}
 
 
+def get_vm_inventory(proxmox):
+    """Cheap cluster-wide VM inventory for change detection (single API call).
+
+    Returns a frozenset of (vmid, name, node, status) tuples for all non-template
+    QEMU guests, or None if the API is unreachable. Comparing two signatures tells
+    us whether the VM set / their names / run state changed, without the expensive
+    per-VM guest-agent calls that get_domains performs.
+    """
+    try:
+        resources = proxmox.cluster.resources.get(type="vm")
+    # Degrade any transient API failure (timeout, 5xx/596, SSL, connection) to None
+    # so the 2s polling loop just skips this tick and keeps its state, instead of
+    # letting the exception restart the updater thread.
+    except (requests.exceptions.RequestException, ResourceException) as e:
+        logger.error(f"[Proxmox] Failed to query cluster resources: {e}")
+        return None
+
+    signature = set()
+    for res in resources:
+        if res.get("type") != "qemu":
+            continue
+        if res.get("template", 0) == 1:
+            continue
+        signature.add((res.get("vmid"), res.get("name"), res.get("node"), res.get("status")))
+    return frozenset(signature)
+
+
 def get_domains(proxmox):
     domains = []
     try:
         nodes = proxmox.nodes.get()
-    except requests.exceptions.ConnectionError as e:
-        logger.error(f"[Proxmox] Failed to connect to api: {e}")
+    # Same broad guard as get_vm_inventory: a transient error returns None so the
+    # caller keeps the previous list rather than crashing the updater thread.
+    except (requests.exceptions.RequestException, ResourceException) as e:
+        logger.error(f"[Proxmox] Failed to list nodes: {e}")
         return None
 
     for node in nodes:
