@@ -27,7 +27,7 @@ permissions:
 # destroy something — the :<sha> image of the commit being built, the only rollback point for it —
 # which is why it is false there and true here.
 concurrency:
-  group: pr-${ github.ref }
+  group: pr-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -51,7 +51,7 @@ jobs:
     # PR check running at the same time as the publishing workflow — and ci/smoke.py refuses to start
     # without this variable rather than falling back to a constant.
     env:
-      SMOKE_NAME: proxmox_dns-smoke-${ github.run_id }
+      SMOKE_NAME: proxmox_dns-smoke-${{ github.run_id }}
     steps:
     - uses: actions/checkout@v7
       with:

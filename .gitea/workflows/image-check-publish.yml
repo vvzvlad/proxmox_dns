@@ -50,7 +50,7 @@ permissions:
 # instance does not reject this block, it IGNORES it: the runs stop being serialised and nothing in
 # the run list says so — the failure surfaces as production occasionally running the previous commit.
 concurrency:
-  group: image-${ github.ref }
+  group: image-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -75,7 +75,7 @@ jobs:
     # refuses to start without this variable rather than falling back to a constant, which would
     # reintroduce exactly that collision.
     env:
-      SMOKE_NAME: proxmox_dns-smoke-${ github.run_id }
+      SMOKE_NAME: proxmox_dns-smoke-${{ github.run_id }}
     steps:
     - uses: actions/checkout@v7
       with:
