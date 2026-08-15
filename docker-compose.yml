@@ -1,35 +1,63 @@
-# Deploy template. Pull the prebuilt image from ghcr.io — do NOT build on prod.
+# Deploy template, kept in step with the Portainer stack that actually runs this service.
+# Pull the prebuilt image from the Gitea registry — do NOT build on prod.
 # Values below are PLACEHOLDERS (XXX), not real secrets.
 #
-# ProxDNS is a DNS server: it publishes raw UDP :53 and an HTTP status page,
-# so it is exposed via direct port mapping (NOT via Traefik's HTTP router).
-# It is stateless -> no data volume is needed.
+# NAMING: the repository, this directory, the service, the container, the Portainer stack and the
+# image all use the same name, proxmox_dns, with an underscore. The DNS name the service is reached
+# by is a separate thing and is deliberately NOT renamed — see the Traefik labels below.
+#
+# proxmox_dns publishes raw UDP :53 and an HTTP status page. The UDP port is why this stack is not
+# purely a Traefik affair: DNS cannot go through an HTTP router, so :53 is mapped directly on the
+# host and the HTTP side is reachable both on :8076 and through Traefik.
+# The service is stateless -> no data volume is needed.
+#
+# RECREATING THIS CONTAINER BRIEFLY TAKES DOWN NAME RESOLUTION FOR THE WHOLE INTERNAL NETWORK.
+# It is the authoritative server for the `.lc` zone, so between `docker stop` and the moment the new
+# container binds :53 again, every `.lc` name on the network fails to resolve — including the names
+# of the hosts an operator is likely to be in the middle of using. Redeploy accordingly.
 
 services:
-  proxdns:
-    image: ghcr.io/vvzvlad/proxmox_dns:latest
-    container_name: proxdns
-    restart: always
+  proxmox_dns:
+    image: gitea.vvzvlad.xyz/projects/proxmox_dns:latest
+    container_name: proxmox_dns
+    restart: unless-stopped
     ports:
       # DNS is served over UDP only (the server binds a UDP socket).
       - "53:53/udp"
       - "8076:80/tcp"        # HTTP status page: /, /json, /health
     environment:
+      # No defaults in code for these three: a missing one fails at startup with a message naming it,
+      # rather than starting up and serving an empty zone.
       PROXMOX_HOST: XXX
       PROXMOX_USER: XXX
       PROXMOX_PASSWORD: XXX
-      LOG_LEVEL: INFO
-      SUBDOMAINS: "false"
-      TZ: Europe/Moscow
+      LOG_LEVEL: WARNING
+      SUBDOMAINS: "true"
     logging:
       driver: "json-file"
       options:
         max-file: 5
         max-size: 10m
     labels:
-      com.centurylinklabs.watchtower.enable: "true"   # auto-update the image
+      traefik.enable: "true"
+      # The DNS name is proxdns.borneo.lc and STAYS proxdns.borneo.lc even though everything else
+      # here was renamed to proxmox_dns. It is an external name: links, bookmarks and anything that
+      # has it written down would break, and renaming it buys nothing.
+      traefik.http.routers.proxmox_dns.rule: Host(`proxdns.borneo.lc`)
+      traefik.http.services.proxmox_dns.loadBalancer.server.port: 80
+      traefik.http.routers.proxmox_dns.entrypoints: websecure
+      traefik.http.routers.proxmox_dns.tls: true
+      com.centurylinklabs.watchtower.enable: true   # auto-update the image
     healthcheck:
-      test: ["CMD", "curl", "-s", "-f", "-o", "/dev/null", "http://127.0.0.1:80/health"]
-      interval: 30m
-      timeout: 5s
+      test: ["CMD", "curl", "-f", "http://localhost:80"]
+      # THE TIMINGS ARE LOAD-BEARING, do not raise them "because the service is stable".
+      # Docker schedules the FIRST probe one whole `interval` after the container starts (or after
+      # `start_period`, whichever applies), so a container with `interval: 30m` reports `starting`
+      # for half an hour and never once reports `healthy` in any window an updater is watching. The
+      # Portainer image updater waits 120 s for `healthy` and rolls the image back if it does not
+      # see it — which is precisely how the zakhar-voice-assistant update silently reverted on
+      # 2026-08-15. At 30s/5s the container is healthy within ~10 s and the update sticks.
+      interval: 30s
+      timeout: 2s
       retries: 2
+      start_period: 5s
