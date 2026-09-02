@@ -3,3 +3,7 @@ proxmoxer==2.1.0
 requests==2.31.0
 colorama==0.4.6
 pydantic-settings==2.7.0
+# Pinned explicitly rather than left to pydantic-settings to drag in: src/config_errors.py imports
+# `ValidationError` from pydantic directly, so it is a direct dependency of this code and its
+# version must not be free to move underneath it.
+pydantic==2.13.4

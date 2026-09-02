@@ -2,8 +2,8 @@
 
 It sits BETWEEN `docker build` and `docker push`, which is the only place it is worth anything:
 nobody presses a button between the push and the rollout — the deployed stack carries
-`com.centurylinklabs.watchtower.enable`, so an updater polls `:latest` and redeploys whatever lands
-on it. This gate is the last point at which a broken image can still be stopped.
+`io.portainer.update.enable`, so an updater polls `:latest` and redeploys whatever lands on it. This
+gate is the last point at which a broken image can still be stopped.
 
 What it is guarding is unusually load-bearing for a service this small: proxmox_dns answers DNS for
 the whole internal `.lc` zone. An image that starts but does not serve does not degrade the network,
@@ -19,8 +19,8 @@ can be answered from a process already running inside it.
 
 The two INNER halves are PROBES: programs that live here as string constants and are fed to
 `docker exec -i <name> python -u -`. The IMAGE probe answers everything about the FILES and the
-dependencies inside the image. The SERVICE probe answers whether the running process is really
-SERVING — over HTTP and, more importantly, over DNS.
+dependencies inside the image. The SERVICE probe answers WHO the running process is and whether it
+is really SERVING — over HTTP and, more importantly, over DNS.
 
 They run inside for two reasons. The obvious one is that those objects only exist in there. The
 other shapes this whole file: **this job and the docker daemon are not in the same network
@@ -34,10 +34,20 @@ job's 127.0.0.1 is a different loopback entirely, so the gate would be talking t
 Everything internal therefore goes through `docker exec`, which puts the probe in the container's own
 namespace — where 127.0.0.1 means what the compose healthcheck means by it.
 
-Two more properties of `docker exec` are worth stating because checks below depend on them: it does
-NOT go through ENTRYPOINT (which is why the contract check insists there is none, rather than
-assuming it), and it runs as the image's `Config.User` — root here, which is also what lets the
-service bind port 53 in the first place.
+Two more properties of `docker exec` are worth stating because checks below depend on them, and both
+cut the same way. It does NOT go through ENTRYPOINT, and it runs as the image's `Config.User` —
+which the Dockerfile deliberately leaves unset, so every probe here arrives as ROOT while the
+service itself does not. The image declares `/entrypoint.sh`, which starts as root, chowns the state
+directory and `exec`s gosu to drop to uid 1000. A probe that asked for its OWN uid would therefore
+answer 0 on a perfectly good image, and 0 just the same on one that never drops privileges at all.
+So the non-root check interrogates PID 1 — the only process in the container that came through the
+entrypoint — and the contract check pins the ENTRYPOINT to an exact value rather than reading the
+privilege drop off the image's declarations, which cannot show whether it still happens.
+
+Nothing here grants a capability to bind 53/udp, and nothing needs to: docker sets
+net.ipv4.ip_unprivileged_port_start=0 inside a container, so uid 1000 binds 53 and 80 with an empty
+capability set. That is why docker-compose.yml carries no `cap_add` and why the containers below are
+started without one — the gate runs the image the way production does.
 
 WHY A CONTAINER WITH NO PROXMOX IS THE CORRECT TEST BED
 -------------------------------------------------------
@@ -49,7 +59,7 @@ proxmoxer authenticates EAGERLY: `ProxmoxAPI(...)` builds a `ProxmoxHTTPAuth` wh
 to `/access/ticket`. So building the client is a network call, and an unreachable PVE raises out of
 the CONSTRUCTOR. src/app.py used to call `build_client()` on the first line of `run()`, which meant
 an unreachable PVE killed the process BEFORE the DNS and HTTP servers ever bound — and with
-`restart: unless-stopped` that is a crash loop in which the zone resolves nowhere at all.
+`restart: always` that is a crash loop in which the zone resolves nowhere at all.
 `ensure_client()` is the fix: the client is built lazily, the servers start regardless, and the
 updater retries.
 
@@ -65,7 +75,8 @@ THE CHECKS
 ----------
 Each one is written against a way this image has a realistic chance of shipping broken:
 
-* (a) the image's declared contract: CMD, WORKDIR, no ENTRYPOINT. Outer half.
+* (a) the image's declared contract: CMD, WORKDIR, and the ENTRYPOINT that drops privileges. Outer
+      half.
 * (b) `curl` is present AND runs. Not cosmetic and not a style preference: the compose healthcheck
       is `["CMD", "curl", "-f", "http://localhost:80"]`, and the Portainer updater waits 120 s for
       `healthy` before rolling the image back. A base-image bump that drops curl does not fail
@@ -79,10 +90,27 @@ Each one is written against a way this image has a realistic chance of shipping 
 * (f) the DNS server answers a real UDP query on 127.0.0.1:53, for both an A question and a PTR
       question — PTR takes a separate branch through src/dns_server.py and would not be covered by
       the A query. Service probe.
-* (g) .dockerignore did its job: no tests/, .env, .venv or .github/ in the image. Image probe.
+* (g) .dockerignore did its job: no tests/, .env, .venv or .gitea/ in the image. Image probe.
 * (h) the runtime dependencies import: dns, proxmoxer, pydantic_settings, requests. Image probe.
-* (i) the container is still alive at the end, and the log it has BY THEN carries no traceback.
-      Outer half.
+* (i) the container is still alive once everything else has had its turn at it, and the log it has
+      at the very end, after (k) has stopped it, carries no traceback. Outer half.
+* (j) PID 1 — the process the ENTRYPOINT actually started — serves as uid 1000 and not as root. This
+      is the artefact, not the intention: a Dockerfile can carry every non-root instruction there is
+      and still serve as root the moment /entrypoint.sh stops `exec`ing gosu, and (a) would not see
+      it — an image keeps declaring its ENTRYPOINT whatever the script inside it does. Service
+      probe, because it is the only one running where PID 1 can be read.
+* (k) `docker stop` really stops it: SIGTERM reaches PID 1, something ACTS on it, and the container
+      exits 0 instead of sitting out the grace period until the kernel kills it. Two things have to
+      hold for that, and only one of them is visible anywhere else in this file. /entrypoint.sh must
+      `exec`, so python is PID 1 and the signal is delivered at all — (j) catches only the crudest
+      loss of that, since under `su` PID 1 would run as uid 0, while a `sh -c "python main.py"`
+      wrapper keeps the uid and drops the signal all the same. AND src/app.py must install a
+      handler, because PID 1 gets NO default signal dispositions from the kernel: an unhandled
+      SIGTERM at PID 1 is dropped rather than applied, so a process that is PID 1 and does nothing
+      about it passes every other check in this file and still has to be SIGKILLed. Every redeploy
+      would then take the `.lc` zone down for the whole grace period instead of for the second it
+      takes to swap the container. Runs LAST of everything that touches the container, because it
+      ENDS it. Outer half.
 
 Two properties matter and are easy to lose, so they are stated where they can be checked:
 
@@ -124,6 +152,11 @@ ALL_SUFFIXES = (GUARD_SUFFIX, SERVE_SUFFIX)
 # --- The image's declared contract -------------------------------------------------------------
 APP_DIR = "/app"
 EXPECTED_CMD = ["python", "main.py"]
+# Pinned to an exact value rather than merely asserted to exist. This is the only script that stands
+# between the image and serving as root, and every other check in this gate reaches the container
+# through `docker exec`, which walks straight past it — so an image that lost the ENTRYPOINT would
+# answer all of them exactly as it does now while quietly going back to running python as uid 0.
+EXPECTED_ENTRYPOINT = ["/entrypoint.sh"]
 
 # --- The three startup markers ------------------------------------------------------------------
 # All three are logged at CRITICAL by src/app.py, src/dns_server.py and src/http_server.py, so they
@@ -164,16 +197,17 @@ TRACEBACK_MARKER = "Traceback (most recent call last)"
 IMAGE_PROBE_MARKER = "proxmox_dns image probe ok"
 SERVICE_PROBE_MARKER = "proxmox_dns service probe ok"
 EXPECTED_IMAGE_PROBE_TARGETS = 11
-EXPECTED_SERVICE_PROBE_TARGETS = 11
+# 1 identity + 2 /health + 2 /json + 2 / + 1 404 + 2 per DNS question, A and PTR.
+EXPECTED_SERVICE_PROBE_TARGETS = 12
 
 IMAGE_PROBE_ROW_PREFIX = "[in-image] "
 SERVICE_PROBE_ROW_PREFIX = "[in-container] "
 
 # Total verdicts a healthy run ends with, checked against the real count before the summary is
 # printed. Outer half: 3 contract + 6 config guard + 1 serving start + 3 startup markers + 1 alive
-# + 1 clean log = 15. Each probe contributes its own targets plus the two consistency rows run_probe
-# appends (its exit status, and that it ran to its end).
-EXPECTED_OUTER_TARGETS = 15
+# + 2 SIGTERM shutdown + 1 clean log = 17. Each probe contributes its own targets plus the two
+# consistency rows run_probe appends (its exit status, and that it ran to its end).
+EXPECTED_OUTER_TARGETS = 17
 EXPECTED_TOTAL_TARGETS = (
     EXPECTED_OUTER_TARGETS
     + EXPECTED_IMAGE_PROBE_TARGETS + 2
@@ -189,6 +223,21 @@ START_TIMEOUT = 60
 LOGS_TIMEOUT = 30
 IMAGE_PROBE_TIMEOUT = 120
 SERVICE_PROBE_TIMEOUT = 120
+# What `docker stop` gives the process before the kernel takes over, and it has to be generous for
+# check (k) to mean anything: a bound short enough to kill a process that WAS shutting down would
+# report a working image as one that never got the signal. A correct image needs a fraction of this
+# — the main loop returns as soon as the handler sets its Event and the interpreter exits.
+#
+# DELIBERATELY NOT the 45 s docker-compose.yml asks for. That value buys the SLOW case: a stop that
+# lands while the startup fetch is out at an unreachable PVE, which PEP 475 makes the process finish
+# before it notices anything. This gate stops a container that is long past startup and sitting in
+# its reporting loop, so the slow case is not the one under test here — and copying 45 s in would
+# only make a genuinely wedged image take more than twice as long to be reported as wedged.
+SIGTERM_GRACE = 20
+# Must exceed SIGTERM_GRACE, or the docker CLIENT would be killed on the runner while the daemon
+# was still waiting out the grace period — and the container would then be judged by an inspect
+# that ran mid shutdown.
+STOP_TIMEOUT = 60
 
 # Wall-clock budget for all three startup markers to appear. Generous against a cold, loaded runner:
 # the process has to import pydantic, dnspython and proxmoxer, fail one connection attempt to
@@ -221,15 +270,18 @@ PRESENT = [
     ("/app/main.py", "the entry point the image's CMD runs"),
     ("/app/src/app.py", "the application package"),
 ]
-# What .dockerignore is supposed to have kept out. tests/ and .github/ are build-time only; .venv is
+# What .dockerignore is supposed to have kept out. tests/ and .gitea/ are build-time only; .venv is
 # a host-built tree that would shadow the interpreter's own packages; .env is the one that matters
 # most, because a leaked one would carry real Proxmox credentials into a published image AND would
 # quietly satisfy the configuration guard that check (c) relies on being able to fail.
+# The workflow directory is named for the forge this repo actually lives on: a check written against
+# `.github` would pass on every build without ever looking at a path this repository contains, which
+# is the shape of a check that has quietly stopped proving anything.
 ABSENT = [
     ("/app/tests", "the test tree"),
     ("/app/.env", "a real credentials file"),
     ("/app/.venv", "a host-built virtualenv"),
-    ("/app/.github", "the old GitHub workflow directory"),
+    ("/app/.gitea", "the CI workflow directory"),
 ]
 # The runtime dependencies, by the name the code imports them under.
 IMPORTS = ["dns", "proxmoxer", "pydantic_settings", "requests"]
@@ -354,6 +406,13 @@ HTTP_TIMEOUT = 10
 DNS_ADDRESS = "127.0.0.1"
 DNS_PORT = 53
 DNS_TIMEOUT = 10
+
+# The uid the Dockerfile creates and /entrypoint.sh drops to with gosu. Checked against PID 1 and
+# NOT against this probe's own uid: `docker exec` does not go through ENTRYPOINT and runs as the
+# image's Config.User, which the Dockerfile deliberately leaves unset — so os.getuid() here is 0 on
+# a perfectly good image and would be 0 just the same on one that never drops privileges at all.
+# PID 1 is the only process in this container that came through the entrypoint.
+APP_UID = 1000
 # A name in the served zone that no VM can be called, and a PTR for a TEST-NET-1 address. With an
 # unreachable PVE the domain list is empty, so src/dns_server.py must answer NXDOMAIN to both.
 UNKNOWN_NAME = "nothing-here-smoke.lc"
@@ -378,6 +437,52 @@ def fetch(path):
         return error.code, error.read().decode("utf-8", "replace"), None
     except Exception as error:
         return None, "", describe(error)
+
+
+def pid1_uid():
+    """The REAL uid of PID 1, read out of procfs.
+
+    The `Uid:` line in /proc/<pid>/status is tab-separated as real, effective, saved, fs. The FIRST
+    column is the one taken: an effective uid of 1000 sitting on a real uid of 0 is a process that
+    can climb straight back, and reading the second column would call that a pass.
+
+    procfs and not `ps`: python:3.11-slim ships no procps, so a `ps` here would fail on the image
+    being tested rather than on anything it is testing.
+    """
+    with open("/proc/1/status") as handle:
+        for line in handle:
+            if line.startswith("Uid:"):
+                return int(line.split()[1])
+    return None
+
+
+def check_process_identity():
+    """(j) Who is actually serving — the running process, not the image's declarations.
+
+    This interrogates the artefact rather than the intention, and that is the entire point: a
+    Dockerfile can carry every non-root instruction there is while /entrypoint.sh has quietly
+    stopped `exec`ing gosu, and no other check in this gate would see the difference — they all
+    arrive through `docker exec`, which never goes through the entrypoint at all.
+
+    Runs FIRST, before the HTTP and DNS checks, so that the identity of the process answering them
+    is established before anything is asked of it.
+    """
+    target = "PID 1 serves as uid {} rather than as root".format(APP_UID)
+    try:
+        uid = pid1_uid()
+    except Exception as error:
+        return [(target, "/proc/1/status could not be read: {}".format(describe(error)))]
+    if uid is None:
+        return [(target, (
+            "/proc/1/status carried no Uid: line, so the serving process cannot be identified and "
+            "this claim cannot be made about it"))]
+    return [(target, None if uid == APP_UID else (
+        "it runs as uid {}. {}".format(uid, (
+            "That is root: the privilege drop did not happen. Either /entrypoint.sh stopped "
+            "`exec`ing gosu, or the ENTRYPOINT is off the image and the CMD ran on its own"
+        ) if uid == 0 else (
+            "That is neither root nor the `app` account the image creates, so the ownership the "
+            "Dockerfile and the entrypoint put on /app/data belongs to somebody else"))))]
 
 
 def check_health():
@@ -486,6 +591,7 @@ def ask_dns(label, question_name, rdtype):
 
 def main():
     rows = []
+    rows.extend(check_process_identity())
     rows.extend(check_health())
     rows.extend(check_json())
     rows.extend(check_index())
@@ -631,15 +737,19 @@ def check_image_contract(image):
             "a silent change here means the gate and the deployment are describing two different "
             "programs".format(cmd))))
 
-    # An ENTRYPOINT would prepend itself to the CMD above, so `docker run <image>` would no longer be
-    # `python main.py`. It would also diverge from `docker exec`, which never goes through one — so
-    # the two probes and the boot check would be talking about different command lines.
+    # The ENTRYPOINT prepends itself to the CMD above, and that is the whole privilege drop: the
+    # image runs `/entrypoint.sh python main.py`, the script starts as root, chowns the state
+    # directory and `exec`s gosu to hand the process to uid 1000. Losing this line does not break
+    # anything visibly — the CMD still runs, the service still serves, every other check here still
+    # passes — it just serves as root again, which is precisely why it is pinned by value here and
+    # cross-checked against PID 1's real uid in the service probe.
     entrypoint = config.get("Entrypoint")
     rows.append((
-        "the image declares no ENTRYPOINT, so its CMD is the whole command line",
-        None if not entrypoint else (
-            "it declares {!r}, which is prepended to the CMD. Every `docker run` in this gate now "
-            "executes something other than what it reports".format(entrypoint))))
+        "the image's ENTRYPOINT is {}".format(EXPECTED_ENTRYPOINT),
+        None if entrypoint == EXPECTED_ENTRYPOINT else (
+            "it is {!r}. That script is the only thing dropping this container from root to uid "
+            "1000; without it the CMD runs on its own, as root, and nothing else in the image "
+            "declares a user".format(entrypoint))))
 
     working_dir = config.get("WorkingDir")
     rows.append((
@@ -830,6 +940,74 @@ def check_container_alive(name, started):
         "state".format(state)))]
 
 
+def check_sigterm_shutdown(name, started):
+    """(k) SIGTERM reaches PID 1 and it shuts ITSELF down instead of being killed.
+
+    `docker stop` is exactly what a redeploy does: SIGTERM, wait out the grace period, then
+    SIGKILL. So this check is the redeploy, run against the image before it can be pushed.
+
+    An exit code of 0 means the signal was both delivered and acted on: /entrypoint.sh `exec`ed, so
+    python is PID 1, AND src/app.py installed a handler that sets the Event its main loop waits on.
+    Both are needed and the two failure codes below say which half went.
+
+    137 is 128+9 — SIGKILL, sent because the grace period ran out with the process still alive.
+    That is the shape of the bug this check was written for: PID 1 gets no default signal
+    dispositions from the kernel, so a python process that installs no handler has SIGTERM DROPPED
+    on it and does not even notice the stop. Nothing else in this gate can see that — the container
+    is PID 1, runs as uid 1000 and serves both protocols perfectly right up to the moment it has to
+    be killed.
+
+    143 is 128+15 — SIGTERM arrived and terminated the process outright, i.e. it was delivered to
+    something with the default disposition. On this image that means the handler is gone but python
+    is no longer PID 1 either (a shell wrapper took the slot), because at PID 1 the same missing
+    handler produces 137 instead.
+
+    Either way the cost is the same and it is not abstract: the `.lc` zone resolves nowhere for the
+    whole grace period on every single redeploy, instead of for the moment it takes the replacement
+    container to bind :53.
+
+    LAST of everything that touches the container, because it ENDS it. check_final_log() below
+    still reads the log of a stopped container, and `docker rm -f` still removes one.
+    """
+    stop_target = "`docker stop` completes within the {} s grace period".format(SIGTERM_GRACE)
+    code_target = "the serving container exits 0 on SIGTERM rather than being killed"
+    if not started:
+        reason = "not attempted: the serving container never started"
+        return [(stop_target, reason), (code_target, reason)]
+
+    status, output = docker(["stop", "-t", str(SIGTERM_GRACE), name], STOP_TIMEOUT)
+    if status is None:
+        # No exit code at all: the bound fired or docker is missing, and neither is a verdict about
+        # the image. `docker stop` itself exits 0 even when it had to SIGKILL, so the exit code
+        # below is the row that judges the shutdown; this one only says the call completed.
+        return [(stop_target, output), (code_target, "not attempted: " + output)]
+    if status != 0:
+        reason = "`docker stop` exited {}:\n{}".format(status, excerpt(output))
+        return [(stop_target, reason), (code_target, "not attempted: " + reason)]
+    rows = [(stop_target, None)]
+
+    status, output = docker(["inspect", "--format", "{{.State.ExitCode}}", name], INSPECT_TIMEOUT)
+    if status is None:
+        rows.append((code_target, output))
+        return rows
+    if status != 0:
+        rows.append((code_target, "`docker inspect` exited {}: {}".format(status, excerpt(output))))
+        return rows
+    code = output.strip()
+    rows.append((code_target, None if code == "0" else (
+        "it exited {!r}. {} Both halves have to hold for a container to stop by itself: "
+        "/entrypoint.sh must `exec` so python IS PID 1, and src/app.py must install a SIGTERM "
+        "handler, because PID 1 is given no default signal dispositions and an unhandled signal "
+        "there is dropped. Without them every redeploy takes the `.lc` zone down for the whole "
+        "grace period".format(code, {
+            "137": "That is 128+9: SIGKILL, sent because the {} s grace period ran out with the "
+                   "process still alive — nothing acted on SIGTERM at all.".format(SIGTERM_GRACE),
+            "143": "That is 128+15: SIGTERM terminated the process outright, so it reached "
+                   "something running with the default disposition rather than a handler.",
+        }.get(code, "That is neither a clean exit nor a signal this gate recognises.")))))
+    return rows
+
+
 def check_final_log(name, started):
     """(i) The log the container has BY NOW is free of tracebacks.
 
@@ -901,8 +1079,13 @@ def main():
         rows.extend(service_probe_rows)
 
         # After the probes on purpose: "the container is still up" is only worth anything once
-        # everything else has had its turn at it.
+        # everything else has had its turn at it. Before the stop below for the same reason — this
+        # row is about a container that is supposed to be alive.
         rows.extend(check_container_alive(name + SERVE_SUFFIX, serve_started))
+
+        # Ends the container, so it goes after everything that needed it alive and before the two
+        # steps that do not: the final log and the cleanup both work on a stopped container.
+        rows.extend(check_sigterm_shutdown(name + SERVE_SUFFIX, serve_started))
 
         # LAST, and that is the reason it exists: the log the container has at this point is the
         # whole run rather than the snapshot the boot wait returned.
