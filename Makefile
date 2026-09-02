@@ -4,8 +4,11 @@
 # --- Configuration -----------------------------------------------------------
 VENV   ?= .venv
 PY     := $(VENV)/bin/python
-PIP    := $(VENV)/bin/pip
-PYTEST := $(VENV)/bin/pytest
+# Both go through `python -m` rather than the console scripts: the scripts carry a shebang with
+# the absolute path of the venv they were created in, so a moved or copied project directory
+# leaves them pointing at an interpreter that is no longer there.
+PIP    := $(VENV)/bin/python -m pip
+PYTEST := $(VENV)/bin/python -m pytest
 
 .DEFAULT_GOAL := help
 

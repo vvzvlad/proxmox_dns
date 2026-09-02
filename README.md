@@ -68,15 +68,21 @@ the whole internal zone, so an image that starts but does not answer does not
 degrade the network, it removes name resolution from it. The unit tests prove the
 *source* is good; only this proves the *image* is.
 
-It checks that the image declares the command it is deployed with; that `curl`
-is present **and runs** (the compose healthcheck shells out to it, and a
-container that never reports healthy gets rolled back silently); that a run with
-no configuration names all three missing variables and exits non-zero; that the
-real command starts and logs all three startup markers **with PVE unreachable**;
-that HTTP answers `/health`, `/json`, `/` and 404s anything else; that a real UDP
-query on `127.0.0.1:53` comes back NXDOMAIN with a matching id, for an A question
-and a PTR question both; that `.dockerignore` kept `tests/`, `.env`, `.venv` and
-`.github/` out; and that every runtime dependency imports.
+It checks that the image declares the command and the entrypoint it is deployed
+with; that `curl` is present **and runs** (the compose healthcheck shells out to
+it, and a container that never reports healthy gets rolled back silently); that a
+run with no configuration names all three missing variables and exits non-zero;
+that the real command starts and logs all three startup markers **with PVE
+unreachable**; that **PID 1 serves as uid 1000 and not as root**; that HTTP
+answers `/health`, `/json`, `/` and 404s anything else; that a real UDP query on
+`127.0.0.1:53` comes back NXDOMAIN with a matching id, for an A question and a
+PTR question both; that `.dockerignore` kept `tests/`, `.env`, `.venv` and
+`.gitea/` out; and that every runtime dependency imports.
+
+The uid check reads `/proc/1/status` rather than its own uid on purpose: the
+probes arrive through `docker exec`, which never goes through the entrypoint, so
+they run as root on a perfectly good image. PID 1 is the only process in the
+container that came through the privilege drop.
 
 Two things about it are deliberate and are explained at length in its module
 docstring. It boots the image with credentials pointing at `127.0.0.1`, because
@@ -90,9 +96,22 @@ do not build on prod; the image is auto-updated from `:latest`.
 
 proxmox_dns publishes raw UDP `:53` and an HTTP status port. DNS cannot go through
 an HTTP router, so `:53` is mapped directly on the host while the status page is
-also routed by Traefik. `docker-compose.yml` in this repo is the deploy template
-and is kept in step with the running stack. Note that recreating the container
-briefly takes `.lc` name resolution down for the whole network.
+also routed by Traefik. `docker-compose.yml` in this repo is an EXAMPLE — an
+illustration of how the service is configured, meant to be copied as a starting
+point. It is deliberately NOT kept in sync with the running stack, and must not
+be: the Portainer stack that actually runs is the only source of truth for its
+variables, volume paths, domain and image tag. A difference between the two is
+therefore not a defect to reconcile — do not "fix" this file against a running
+deployment, and do not change a deployment to match it. Every value in it is a
+placeholder; see the header of the file itself. Note that recreating the
+container briefly takes `.lc` name resolution down for the whole network.
+
+The container serves as the unprivileged user `app` (uid 1000): `entrypoint.sh`
+starts as root, chowns `/app/data` and drops privileges with `gosu` before python
+runs — so the Dockerfile carries no `USER` directive and must not gain one. It
+needs **no** `cap_add: [NET_BIND_SERVICE]` for ports 53 and 80, because docker
+sets `net.ipv4.ip_unprivileged_port_start=0` inside the container and there are no
+privileged ports in there to begin with.
 
 ## Proxmox setup
 Create a user with the required permissions:

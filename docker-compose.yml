@@ -1,6 +1,29 @@
-# Deploy template, kept in step with the Portainer stack that actually runs this service.
-# Pull the prebuilt image from the Gitea registry — do NOT build on prod.
-# Values below are PLACEHOLDERS (XXX), not real secrets.
+# EXAMPLE compose — an illustration of how this service is configured, NOT a copy of what runs.
+#
+# What it is for: showing which variables the service reads, which volumes and ports it needs,
+# and which labels matter. Copy it as a starting point for a deployment. That is the whole job.
+#
+# It is NOT kept in sync with the running deployment and MUST NOT BE. Wherever this service
+# actually runs — in this fleet, a Portainer stack — THAT deployment is the only source of truth
+# for what it does: its variables, its volume paths, its domain, its image tag. This file cannot
+# answer any of those questions, and it is not trying to. A difference between the two is
+# therefore NOT a defect and NOT something to reconcile: there is nothing here to bring into
+# agreement. Do not "fix" this file against a running deployment, and do not change a deployment
+# to match this file.
+#
+# NOTHING REAL GOES IN HERE. Not a password, not a token, not a key, not a host. Every value below
+# is a PLACEHOLDER: `XXX` for a secret, `example.com` or `example.lc` for a name, a documentation
+# address (RFC 5737 — 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24) for an IP. That holds INSIDE
+# COMMENTS TOO, and it holds for a value that is only a default rather than a credential. Never
+# write a real one here, and never "correct" a placeholder to the value some deployment happens to
+# use. Naming a real host is precisely what makes the next reader believe this file describes
+# production — the mistake this header exists to prevent, and one that keeps being made. Several
+# of these repositories are public and mirrored: a secret committed here is a secret published.
+#
+# ONE deliberate exception: the registry host, wherever it appears — in the image path or in a
+# comment. It is real, because without it there is nothing to pull.
+#
+# Deploy from a prebuilt image — a `build:` here, where present, is for running locally.
 #
 # NAMING: the repository, this directory, the service, the container, the Portainer stack and the
 # image all use the same name, proxmox_dns, with an underscore. The DNS name the service is reached
@@ -12,15 +35,49 @@
 # The service is stateless -> no data volume is needed.
 #
 # RECREATING THIS CONTAINER BRIEFLY TAKES DOWN NAME RESOLUTION FOR THE WHOLE INTERNAL NETWORK.
-# It is the authoritative server for the `.lc` zone, so between `docker stop` and the moment the new
-# container binds :53 again, every `.lc` name on the network fails to resolve — including the names
-# of the hosts an operator is likely to be in the middle of using. Redeploy accordingly.
+# It is the authoritative server for the internal `example.lc` zone, so between `docker stop` and
+# the moment the new container binds :53 again, every `example.lc` name on the network fails to
+# resolve — including the names of the hosts an operator is likely to be in the middle of using.
+# Redeploy accordingly.
 
 services:
   proxmox_dns:
     image: gitea.vvzvlad.xyz/projects/proxmox_dns:latest
     container_name: proxmox_dns
-    restart: unless-stopped
+    restart: always
+    # Longer than docker's 10 s default, and it is a real setting rather than padding.
+    #
+    # The process installs its SIGTERM handler first thing, but installing one only RECORDS the
+    # signal: under PEP 475 CPython resumes the interrupted syscall after the handler returns, so a
+    # stop that lands while the startup fetch is out at PVE is not acted on until that fetch comes
+    # back. That fetch is one guest-agent call per VM through proxmoxer, 5 s default timeout each,
+    # so a PVE that is black-holing packets — exactly the case worth stopping the container in —
+    # blows through 10 s with only a couple of VMs. The container is then SIGKILLed on exit 137,
+    # taking the authoritative server for the whole internal `example.lc` zone with it mid-redeploy.
+    #
+    # 45 s is the CEILING, not a wait: src/app.py checks the shutdown flag between the steps of its
+    # startup sequence and the main loop waits on the Event, so an ordinary stop still returns in
+    # milliseconds. What this buys is that the slow case ends in a clean exit instead of a kill.
+    stop_grace_period: 45s
+    security_opt:
+      # Forbids privilege escalation through setuid binaries. The container serves as the
+      # unprivileged `app` user (uid 1000): /entrypoint.sh starts as root, chowns the state
+      # directory and `exec`s gosu to drop to 1000 before python ever runs. That is compatible with
+      # this flag rather than at odds with it — no-new-privileges blocks GAINING privileges, and the
+      # only thing happening here is giving them up. It is set BEFORE the drop, so it also covers
+      # the serving process: a compromised python cannot climb back out through a setuid binary.
+      - no-new-privileges:true
+    # There is deliberately NO `cap_add: [NET_BIND_SERVICE]` here, and it must not be added "just in
+    # case". Classic Linux would need it — 53 and 80 are both below 1024 — but docker sets
+    # net.ipv4.ip_unprivileged_port_start=0 inside every container, so there are no privileged ports
+    # in here at all and uid 1000 binds both with an empty capability set. Measured on the host this
+    # stack runs on, which is deliberately not named here — `example.lc` everywhere in this file is
+    # the placeholder for the ZONE, never for a host (Docker 27.1.1):
+    #   docker run --rm --user 1000 --security-opt no-new-privileges --cap-drop ALL python:3.11-slim
+    #   BIND OK   53/udp uid=1000
+    #   BIND OK   80/tcp uid=1000
+    # For the same reason the ports below stay on 53 and 80 inside the container; moving the service
+    # to high ports would buy nothing and break every published mapping.
     ports:
       # DNS is served over UDP only (the server binds a UDP socket).
       - "53:53/udp"
@@ -33,6 +90,9 @@ services:
       PROXMOX_PASSWORD: XXX
       LOG_LEVEL: WARNING
       SUBDOMAINS: "true"
+      # Without it the container runs on UTC and every log line is three hours off the clock of
+      # whoever is reading it while chasing an incident.
+      TZ: Europe/Moscow
     logging:
       driver: "json-file"
       options:
@@ -40,14 +100,22 @@ services:
         max-size: 10m
     labels:
       traefik.enable: "true"
-      # The DNS name is proxdns.borneo.lc and STAYS proxdns.borneo.lc even though everything else
-      # here was renamed to proxmox_dns. It is an external name: links, bookmarks and anything that
-      # has it written down would break, and renaming it buys nothing.
-      traefik.http.routers.proxmox_dns.rule: Host(`proxdns.borneo.lc`)
+      # The DNS name — `oldname.example.lc` standing in for whatever it actually is — STAYS as it
+      # is even though everything else here was renamed to proxmox_dns. It is an external name:
+      # links, bookmarks and anything that has it written down would break, and renaming it buys
+      # nothing.
+      traefik.http.routers.proxmox_dns.rule: Host(`oldname.example.lc`)
       traefik.http.services.proxmox_dns.loadBalancer.server.port: 80
       traefik.http.routers.proxmox_dns.entrypoints: websecure
-      traefik.http.routers.proxmox_dns.tls: true
-      com.centurylinklabs.watchtower.enable: true   # auto-update the image
+      # Quoted: compose label values are strings, and an unquoted `true` is a YAML boolean that
+      # some parsers hand to Traefik as `True`.
+      #
+      # And no `tls.certresolver` next to it, on purpose. That is a claim about an ABSENCE, so it is
+      # written here, against the label it qualifies, rather than floating above whatever line comes
+      # next: the name lives in the internal `example.lc` zone, for which no public CA — Let's
+      # Encrypt included — can issue a certificate. Traefik serves its default certificate here.
+      traefik.http.routers.proxmox_dns.tls: "true"
+      io.portainer.update.enable: "true"   # auto-update the image
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:80"]
       # THE TIMINGS ARE LOAD-BEARING, do not raise them "because the service is stable".

@@ -43,6 +43,16 @@ make run
   broken is an intention, not an invariant — so when fixing a bug, check the new test
   by breaking the mechanism again and confirming it fails.
 - No `EXPOSE` in the Dockerfile; ports are published in docker-compose.
+- The container runs as the non-root user `app` (uid 1000). `entrypoint.sh` starts as
+  root, chowns `/app/data` and drops privileges with `gosu`, so the Dockerfile carries no
+  `USER` directive — do not add one and do not remove the entrypoint. `ci/smoke.py` checks
+  the drop against PID 1's real uid, not against its own: the probes reach the container
+  through `docker exec`, which walks straight past the entrypoint and arrives as root.
+- Do NOT add `cap_add: [NET_BIND_SERVICE]` to docker-compose.yml. Binding 53 and 80 needs
+  no capability inside a container: docker sets `net.ipv4.ip_unprivileged_port_start=0`,
+  so uid 1000 binds both with an empty capability set (measured on the host this stack runs
+  on, Docker 27.1.1). For the same reason the in-container ports stay
+  53 and 80 — moving the service to high ports buys nothing.
 - The Proxmox client is built LAZILY (`ensure_client()` in `src/app.py`) and every startup
   path tolerates it coming back `None`. proxmoxer authenticates inside `ProxmoxAPI(...)`,
   so building the client is a network call; nothing on the way to the DNS and HTTP threads
