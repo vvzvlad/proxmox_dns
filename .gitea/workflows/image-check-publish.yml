@@ -122,14 +122,14 @@ jobs:
         # self-hosted with a persistent daemon, so a once-pulled python:3.11-slim would serve every
         # run for months. Here that image is the interpreter the whole suite runs on, which makes it
         # an explicit, versioned input rather than whatever happens to be in the cache.
-        # The three PROXMOX_ variables are placeholders that reach no network: src/settings.py
-        # declares them without defaults and is imported at collection time, so a suite that runs
-        # without them depends on tests/conftest.py's setdefault having been imported first. Passing
-        # them here makes the suite independent of that ordering, exactly as the GHCR workflow this
-        # replaces did with its `env:` block.
+        # PROXMOX_HOSTS is a placeholder that reaches no network: src/settings.py declares it
+        # without a default and is imported at collection time, so a suite that runs without it
+        # depends on tests/conftest.py's setdefault having been imported first. Passing it here
+        # makes the suite independent of that ordering, exactly as the GHCR workflow this replaces
+        # did with its `env:` block. Single-quoted so the shell hands the JSON over intact.
         tar --exclude=./.git --exclude=./.venv --exclude=./data --exclude=__pycache__ -cf - . \
           | docker run --rm -i --pull always --name "$SMOKE_NAME-tests" -w /w \
-              -e PROXMOX_HOST=test-host -e PROXMOX_USER=test-user -e PROXMOX_PASSWORD=test-pass \
+              -e PROXMOX_HOSTS='[{"host": "test-host", "user": "test@pve", "token_name": "test", "token_value": "test-token"}]' \
               python:3.11-slim bash -c '
           set -e
           tar -xf -
