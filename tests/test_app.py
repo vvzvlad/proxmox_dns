@@ -1,6 +1,6 @@
 """Startup, shutdown and multi-host merge invariants of src/app.py.
 
-Thirty-two tests in four groups. Three of the first six — the two startup run() ones
+Thirty-three tests in four groups. Three of the first six — the two startup run() ones
 and the updater — defend ONE property, from three directions: whatever the
 Proxmox side does while the process is starting, the DNS and HTTP servers still
 come up. This service answers DNS for the whole internal `.lc` zone, so a startup
@@ -47,18 +47,23 @@ built from every entry of PROXMOX_HOSTS. Two of them are about the host that ans
 LATE, on either side of one rule: its answer is published rather than discarded, but
 never over something that host's own updater has published in the meantime.
 
-Every test in that group THAT EXERCISES initial_domains() reads state.servers_list, and
-none of them reads a return value, because initial_domains() hands nothing back: it
-PUBLISHES, and the write inside it is the only path by which the pre-fill reaches the
-list the DNS server answers from. The two that do not call it — the updater-per-host one
-and the one that counts the HostStates against PROXMOX_HOSTS — are about the wiring
-around that call and read nothing of the zone at all. Three of the group are about the
-harvest itself: the zone is published even when NO host answers; an answer that reached
-its slot is harvested even though its fetch thread has not finished, which is a window a
-harvest keyed on the fetch's done Event used to drop the host's answer in altogether;
-and a host whose fetch FAILED in time is not also reported as having missed the deadline,
-which the harvest can only tell apart because a slot starts at a `pending` sentinel
-rather than at the None a failure stores.
+Every test in that group THAT ASSERTS ON THE PRE-FILL reads state.servers_list, and none
+of them reads a return value, because initial_domains() hands nothing back: it PUBLISHES,
+and the write inside it is the only path by which the pre-fill reaches the list the DNS
+server answers from. Two of the group assert nothing about the zone, and for two
+different reasons. The one that counts the HostStates against PROXMOX_HOSTS is the only
+test here that never reaches initial_domains() at all. The updater-per-host one does
+reach it — it calls run(), so the pre-fill runs and publishes, over a get_domains()
+patched to answer `[]` — but what it is about is the threads started around that call,
+so it looks at the updaters and not at the zone they refresh. Four of the group are about
+the harvest itself: the zone is published even when NO host answers; an answer that
+reached its slot is harvested even though its fetch thread has not finished, which is a
+window a harvest keyed on the fetch's done Event used to drop the host's answer in
+altogether; a host that really has not answered when the deadline fires IS named in the
+warning, which is what keeps the two tests asserting the ABSENCE of that warning from
+passing on a warning that no longer exists; and a host whose fetch FAILED in time is not
+also reported as having missed the deadline, which the harvest can only tell apart
+because a slot starts at a `pending` sentinel rather than at the None a failure stores.
 
 The last group is the multi-host merge. The service polls N INDEPENDENT PVE hosts,
 each on its own thread and each holding its own last-known slice of the zone, and
@@ -196,14 +201,31 @@ class _ClockThatExpiresOnceTheFetchIsParked:
     computation the parking landed on. It can only ever end the wait, never extend it.
 
     IT IS ALSO BOUNDED IN REAL TIME, like every other black hole in this file, and that
-    is the fuse rather than a budget. The Event is set from inside the substituted lock,
-    on a thread recognised by its name, so a change to either could leave it unset for
-    ever — and on a clock that never moves the deadline can never expire, which is a wait
-    loop that polls for ever. There is no pytest-timeout in this project, so that is a
+    is the fuse rather than a budget. What it saves the suite from is a FETCH THAT NEVER
+    RETURNS: nothing parks, so this clock never starts moving and the deadline can never
+    expire, and `done` is never set either, so the wait loop's other exit is closed as
+    well — it polls for ever. There is no pytest-timeout in this project, so that is a
     hang with nothing to end it. After BLACK_HOLE_BOUND real seconds the clock therefore
     advances regardless of the Event: the wait gives up, the harvest runs without the
-    window ever having opened, and the test FAILS on its `assert parked.is_set()` — which
-    is what a regression here should do — instead of wedging the suite.
+    window ever having opened, and the test fails inside _join_the_startup_fetch_of()
+    with "still running 5.0 s after it was released" — the fetch thread being, by
+    construction, exactly that — instead of wedging the suite.
+
+    The parking machinery breaking is NOT what this fuse is for. Break what the LOCK reads
+    on its way out — rename the fetch threads, or swap the `answered` Event — and `__exit__`
+    stops recognising the release: the fetch runs on to its `finally` and sets `done`, the
+    wait loop leaves by that exit without entering its body once, and the test fails on
+    `assert parked.is_set()` in single-digit milliseconds. Both halves of that measured.
+
+    Swapping the `parked` Event THIS clock reads is the other direction, and this fuse is
+    not what that case is FOR either. The fetch parks as before and the clock never starts, so
+    nothing ends the wait until one of TWO BLACK_HOLE_BOUND budgets expires: this clock's,
+    or the `proceed.wait(BLACK_HOLE_BOUND)` inside the park itself. They are the same bound
+    and the order between them is decided by INITIAL_FETCH_POLL, so build nothing on it — when
+    it was measured the park won (released at 30.005 s, the next clock sample not due until
+    ~30.03 s), the fetch ran on, `done` was set, and the wait left by the `done` exit with
+    the thread already finished. Either way the test passes a BLACK_HOLE_BOUND slowly rather
+    than hanging, and neither case is the hang the paragraph above is about.
     """
 
     def __init__(self, parked):
@@ -1089,16 +1111,77 @@ def test_an_answer_already_in_its_slot_is_harvested_before_its_fetch_finishes(
         "by the width of a lock release, so it names hosts that did answer")
 
 
+def test_a_host_that_did_not_answer_by_the_deadline_is_named_in_the_warning(
+        monkeypatch, caplog):
+    """The positive half of that warning, without which the negative halves prove nothing.
+
+    Two tests around this one assert that a host is NOT named in this message, and a
+    negative assertion on a log line is worth exactly as much as the line's own existence.
+    Nothing else pinned it: disable the warning block, or drop the `late.append(...)` that
+    fills its list, and both of those tests stay green — the machinery they are about can
+    be switched off in full and the suite does not notice. Rewording the message does the
+    same thing more quietly still, since both of them match on its wording: they would go
+    on passing, and the `pending` sentinel the one below exists to protect would be
+    covered by nothing at all.
+
+    So the message is pinned from the side that names a host. pve2 is held past a
+    deliberately tiny deadline and pve1 answers at once, which is also the case the
+    warning is written for: the zone is already being served, and this line is the only
+    place that says whose names are missing from it and why.
+    """
+    _isolate_module_state(monkeypatch, ["pve1.test", "pve2.test"])
+    monkeypatch.setattr(app, "build_client", lambda _cfg: object())
+    # Shrunk for the same reason as in the late-publish test above: the value is not what
+    # is under test, and a real 10 s deadline would only make the suite wait for it.
+    monkeypatch.setattr(app, "INITIAL_FETCH_DEADLINE", 0.2)
+    answer = threading.Event()
+    addresses = {"pve1.test": "10.0.0.5", "pve2.test": "10.0.0.6"}
+
+    def pve2_is_still_working_when_the_deadline_fires(_proxmox, host):
+        if host == "pve2.test":
+            answer.wait(BLACK_HOLE_BOUND)
+        return [_entry(host.split(".")[0] + ".lc", host, ipv4=addresses[host])]
+
+    monkeypatch.setattr(app, "get_domains", pve2_is_still_working_when_the_deadline_fires)
+
+    with caplog.at_level("WARNING"):
+        app.initial_domains()
+    # The zone and the log are read off HERE, while pve2 is still blocked, and asserted
+    # after the release below: the late publish that follows changes both, and nothing
+    # here is a claim about what they look like once pve2 has finally answered.
+    zone = _domains_by_host(state.servers_list)
+    warning = caplog.text
+
+    # Released and joined before anything is asserted, exactly as the tests above do: a
+    # fetch left parked here wakes up inside whatever test runs next. See
+    # _join_the_startup_fetch_of.
+    answer.set()
+    _join_the_startup_fetch_of("pve2.test")
+
+    assert zone == {"pve1.lc": "pve1.test"}, (
+        f"the startup fetch published {zone!r}: pve2 was still blocked, so a "
+        "deadline that had fired cannot be what produced this and the warning below would "
+        "be about something else")
+    assert f"pve2.test: no answer within {app.INITIAL_FETCH_DEADLINE} s" in warning, (
+        f"pve2.test had not answered when the deadline fired, and the startup fetch "
+        f"logged:\n{warning}\nThe servers are up and one host's names are missing from the "
+        "zone they answer from; this warning is the only place that is stated at all")
+    assert "pve1.test" not in warning, (
+        f"pve1.test answered well inside the deadline and was named as late anyway:\n"
+        f"{warning}\nThe list in that warning comes from the slots, so a host with an "
+        "answer in its slot cannot be in it")
+
+
 def test_a_host_whose_fetch_failed_in_time_is_not_named_in_the_deadline_warning(
         monkeypatch, caplog):
     """A FAILURE IS NOT A MISSED DEADLINE, and the slots are the only thing telling them apart.
 
     A slot starts as a `pending` sentinel rather than as None, because None is what a
     fetch that RAN AND FAILED stores in it. Collapse the two — `slots = [None] * len(_hosts)`
-    with a harvest keyed on `domains is None`, or a harvest that tests the slot for truth
-    instead of `is pending` — and everything about the zone stays correct while a host that
-    answered in 200 ms is ALSO reported as having gone quiet for INITIAL_FETCH_DEADLINE
-    seconds.
+    with a harvest keyed on `domains is None` — and everything about the zone stays correct
+    while a host that answered in 200 ms is ALSO reported as having gone quiet for
+    INITIAL_FETCH_DEADLINE seconds. That is the whole damage, and none of it shows in the
+    zone: measured, the mutation takes this test down and nothing else in the suite.
 
     The cost is paid by whoever reads the log. A revoked token, or one the privsep step in
     the README never gave an ACL to, fails fast and says so in an ERROR of its own. Stacking

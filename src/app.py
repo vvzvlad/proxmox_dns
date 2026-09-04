@@ -490,10 +490,12 @@ def initial_domains():
     # is still false, so every slot that is filled when this block runs is by construction
     # an on-time answer, and every fetch that has not filled one yet finds `harvested`
     # set. What that fetch does next depends on what it is holding: an ANSWER goes into
-    # the zone from its own thread, through the late branch above, and a FAILURE — None —
-    # is nothing to publish at all, so the host simply keeps the slice it already had.
-    # Neither case needs this harvest, which is what makes skipping them safe. This is
-    # also the last moment at which the slices belong to this function alone.
+    # the zone from its own thread, through the late branch above — unless that host's own
+    # updater has published in the meantime, in which case the newer slice deliberately
+    # wins — and a FAILURE — None — is nothing to publish at all, so the host simply keeps
+    # the slice it already had. Neither case needs this harvest, which is what makes
+    # skipping them safe. This is also the last moment at which the slices belong to this
+    # function alone.
     #
     # `done[index]` DELIBERATELY DOES NOT APPEAR HERE, and requiring it was a bug: it is
     # set in the fetch's `finally`, AFTER the lock is released, so a fetch that had
