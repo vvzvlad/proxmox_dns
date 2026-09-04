@@ -51,21 +51,27 @@ started without one — the gate runs the image the way production does.
 
 WHY A CONTAINER WITH NO PROXMOX IS THE CORRECT TEST BED
 -------------------------------------------------------
-The serving container is started with credentials that point at 127.0.0.1, where no PVE is
-listening. That is deliberate, and it is the single most important thing to understand before
-editing check (d).
+The serving container is started with TWO PROXMOX_HOSTS entries at two DIFFERENT unroutable
+addresses (RFC 5737 documentation ranges), where no PVE will ever answer. All three of those
+properties are deliberate — an unreachable host is what check (d) is about, more than one of them is
+the configuration the service actually runs in, and telling them apart is what lets check (l) count
+the hosts that are really polled — and this is the single most important thing to understand before
+editing either check.
 
-proxmoxer authenticates EAGERLY: `ProxmoxAPI(...)` builds a `ProxmoxHTTPAuth` whose `__init__` posts
-to `/access/ticket`. So building the client is a network call, and an unreachable PVE raises out of
-the CONSTRUCTOR. src/app.py used to call `build_client()` on the first line of `run()`, which meant
-an unreachable PVE killed the process BEFORE the DNS and HTTP servers ever bound — and with
-`restart: always` that is a crash loop in which the zone resolves nowhere at all.
-`ensure_client()` is the fix: the client is built lazily, the servers start regardless, and the
-updater retries.
+The regression this guards against was a network call made on the way to binding the sockets. With
+password auth proxmoxer authenticated EAGERLY — `ProxmoxAPI(...)` built a `ProxmoxHTTPAuth` whose
+`__init__` posts to `/access/ticket` — and src/app.py called `build_client()` on the first line of
+`run()`, so an unreachable PVE killed the process BEFORE the DNS and HTTP servers ever bound. With
+`restart: always` that is a crash loop in which the zone resolves nowhere at all. `ensure_client()`
+is the fix: the client is built lazily, the servers start regardless, and the updater retries.
 
-So the gate boots the image into exactly that state on purpose. It is not a compromise made because
-CI has no Proxmox — it is the regression under test. If the eager call ever comes back, the three
-startup markers below stop appearing and this gate goes red before the image can reach the registry.
+API token auth has since moved the eager call: proxmoxer's token auth stores the token and builds a
+header per request, so the constructor talks to nothing and the first real request is the startup
+fetch instead. THAT DOES NOT MAKE THIS TEST BED OBSOLETE — it makes it the same test one layer down.
+The startup fetch still goes to an unreachable host, on every configured host at once and under a
+deadline, and the three startup markers below are still the receipt that nothing on the way to the
+sockets waits for Proxmox. If that ever stops holding, they stop appearing and this gate goes red
+before the image can reach the registry.
 
 An empty zone is also what makes the DNS check exact rather than approximate: with no VMs known,
 src/dns_server.py answers NXDOMAIN, so there is one right answer to compare against instead of
@@ -82,8 +88,8 @@ Each one is written against a way this image has a realistic chance of shipping 
       `healthy` before rolling the image back. A base-image bump that drops curl does not fail
       loudly — every subsequent update silently rolls back while the image itself looks fine.
       Image probe.
-* (c) the configuration guard really refuses: started with NO environment, the image names ALL
-      THREE required variables and exits non-zero. Outer half.
+* (c) the configuration guard really refuses: started with NO environment, the image names the
+      required variable and exits non-zero. Outer half.
 * (d) the real command starts and reports all three startup markers with PVE unreachable — the
       regression described above. Outer half.
 * (e) the HTTP status server answers: /health, /json, / and a 404 for anything else. Service probe.
@@ -111,6 +117,12 @@ Each one is written against a way this image has a realistic chance of shipping 
       would then take the `.lc` zone down for the whole grace period instead of for the second it
       takes to swap the container. Runs LAST of everything that touches the container, because it
       ENDS it. Outer half.
+* (l) every configured host is actually polled. The two PROXMOX_HOSTS entries are at distinct
+      addresses and the service attributes every failure to the host it came from, so the check is
+      that BOTH names appear in the log. It is the only thing here that would catch a walk over
+      `_hosts` quietly becoming `_hosts[0]`: a build in that state starts, binds, serves and logs
+      failures — all from the first host — while every other host's guests are missing from the
+      zone for ever. Runs right after (d), off the snapshot that check already took. Outer half.
 
 Two properties matter and are easy to lose, so they are stated where they can be checked:
 
@@ -122,9 +134,10 @@ Two properties matter and are easy to lose, so they are stated where they can be
   and less. Each probe's own report lines are parsed back into this gate's report, so a failure
   inside the container is one row in the same list as a failure outside it.
 
-Nothing here holds a credential, and nothing it starts reaches a service outside the runner: the
-only address the container is given is 127.0.0.1, and the password is a literal that authenticates
-nothing. That is what lets this same gate run on a pull request.
+Nothing here holds a credential, and nothing it starts reaches a service anywhere: the only
+addresses the container is given are RFC 5737 documentation addresses, reserved for use in examples
+and routed nowhere, and the API token beside them is a literal that authenticates nothing. That is
+what lets this same gate run on a pull request.
 """
 
 import json
@@ -170,21 +183,39 @@ STARTUP_MARKERS = (STARTUP_MARKER, DNS_MARKER, HTTP_MARKER)
 
 # --- What the configuration guard must say ------------------------------------------------------
 # src/config_errors.py prints this block to stderr and raises SystemExit(1) when a required variable
-# is missing. All three names are required in the output: a guard that named only the first would
-# send an operator round the loop once per variable.
+# is missing. There is exactly ONE required variable now — the whole Proxmox configuration arrives as
+# a JSON list in PROXMOX_HOSTS — and it is still checked by NAME rather than by the header alone: a
+# guard that fires without saying what is missing sends whoever reads it to the source.
 GUARD_HEADER = "Configuration error in environment / .env:"
 GUARD_MISSING_LINE = "Missing required variable(s):"
-REQUIRED_VARIABLES = ("PROXMOX_HOST", "PROXMOX_USER", "PROXMOX_PASSWORD")
+REQUIRED_VARIABLES = ("PROXMOX_HOSTS",)
 
 # --- The environment the serving container gets -------------------------------------------------
-# 127.0.0.1 is the point: nothing listens on the PVE API port inside the container, so the client
-# cannot be built and the gate observes the exact state the ensure_client() fix exists for. The
-# password authenticates nothing anywhere; there is no host in this list that resolves off the
-# runner.
+# TWO ENTRIES AT TWO DIFFERENT ADDRESSES, and both halves of that are load-bearing.
+#
+# Two, because the service polls N INDEPENDENT hosts — a thread, a client and a slice of the zone
+# each, merged into one list — so N>1 is the configuration it actually runs in, and a regression
+# that only appears with more than one host would otherwise sail through both the unit tests and
+# this gate.
+#
+# DIFFERENT, because identical addresses are not countable. With both entries pointing at the same
+# host, everything the log says about one of them says exactly the same about the other, and the
+# commonest way to break multi-host support — polling only `_hosts[0]` — produces a log this gate
+# cannot tell from a healthy one. Distinct addresses make each host's own failure line identifiable,
+# which is what check_every_host_is_polled() below reads.
+#
+# RFC 5737 documentation addresses (TEST-NET-1 and TEST-NET-2): reserved for exactly this, routed
+# nowhere, and nothing on the runner or beyond it answers on them. So every request the service
+# makes fails — which is the state the lazy startup exists for and what check (d) is about — but it
+# fails by TIMING OUT rather than by being refused, at proxmoxer's 5 s per request. The hosts are
+# fetched concurrently, so that costs the boot one timeout rather than two, and BOOT_BUDGET below
+# has room for many more than that. The token authenticates nothing anywhere.
+SERVE_HOSTS = ("192.0.2.1", "198.51.100.1")
 SERVE_ENV = [
-    "PROXMOX_HOST=127.0.0.1",
-    "PROXMOX_USER=smoke@pve",
-    "PROXMOX_PASSWORD=not-a-real-password",
+    "PROXMOX_HOSTS=" + json.dumps([
+        {"host": address, "user": "smoke@pve", "token_name": "smoke-{}".format(index),
+         "token_value": "not-a-real-token"}
+        for index, address in enumerate(SERVE_HOSTS, start=1)]),
 ]
 
 TRACEBACK_MARKER = "Traceback (most recent call last)"
@@ -204,10 +235,11 @@ IMAGE_PROBE_ROW_PREFIX = "[in-image] "
 SERVICE_PROBE_ROW_PREFIX = "[in-container] "
 
 # Total verdicts a healthy run ends with, checked against the real count before the summary is
-# printed. Outer half: 3 contract + 6 config guard + 1 serving start + 3 startup markers + 1 alive
-# + 2 SIGTERM shutdown + 1 clean log = 17. Each probe contributes its own targets plus the two
-# consistency rows run_probe appends (its exit status, and that it ran to its end).
-EXPECTED_OUTER_TARGETS = 17
+# printed. Outer half: 3 contract + 4 config guard (3 fixed rows + one per required variable)
+# + 1 serving start + 3 startup markers + 1 alive + 2 SIGTERM shutdown + 1 clean log = 15, plus
+# one row per configured host for the poll check. Each probe contributes its own targets plus the
+# two consistency rows run_probe appends (its exit status, and that it ran to its end).
+EXPECTED_OUTER_TARGETS = 15 + len(SERVE_HOSTS)
 EXPECTED_TOTAL_TARGETS = (
     EXPECTED_OUTER_TARGETS
     + EXPECTED_IMAGE_PROBE_TARGETS + 2
@@ -240,10 +272,16 @@ SIGTERM_GRACE = 20
 STOP_TIMEOUT = 60
 
 # Wall-clock budget for all three startup markers to appear. Generous against a cold, loaded runner:
-# the process has to import pydantic, dnspython and proxmoxer, fail one connection attempt to
-# 127.0.0.1 (refused instantly, not timed out) and bind two sockets.
+# the process has to import pydantic, dnspython and proxmoxer, run the startup fetch out against two
+# unroutable addresses — concurrently, and capped by INITIAL_FETCH_DEADLINE at 10 s even if
+# proxmoxer's own 5 s timeout ever stopped applying — and bind two sockets.
 BOOT_BUDGET = 60
 BOOT_PAUSE = 0.5
+# The same, for each host's first failure line. A separate budget because it is a separate claim
+# and because the lines can legitimately arrive after the markers: the startup fetch abandons a host
+# at INITIAL_FETCH_DEADLINE and lets the sockets bind, so a host slower than that logs its failure
+# afterwards — and its updater thread retries every couple of seconds regardless.
+HOST_FAILURE_BUDGET = 45
 
 EXCERPT_CHARS = 4000
 
@@ -413,10 +451,13 @@ DNS_TIMEOUT = 10
 # a perfectly good image and would be 0 just the same on one that never drops privileges at all.
 # PID 1 is the only process in this container that came through the entrypoint.
 APP_UID = 1000
-# A name in the served zone that no VM can be called, and a PTR for a TEST-NET-1 address. With an
+# A name in the served zone that no VM can be called, and a PTR for a TEST-NET-3 address. With an
 # unreachable PVE the domain list is empty, so src/dns_server.py must answer NXDOMAIN to both.
+# TEST-NET-3 rather than the TEST-NET-1 this used to ask about: TEST-NET-1 is now where one of the
+# configured PVE hosts lives, and a question about that address would read as though it were about
+# the host rather than about an address nothing in the zone has.
 UNKNOWN_NAME = "nothing-here-smoke.lc"
-UNKNOWN_PTR = "1.2.0.192.in-addr.arpa"
+UNKNOWN_PTR = "1.113.0.203.in-addr.arpa"
 
 
 def describe(error):
@@ -688,6 +729,17 @@ def probe_report_rows(output, prefix):
     return rows
 
 
+def satisfied(logs, marker):
+    """Is one requirement met? A string must appear; a tuple is met by ANY of its strings.
+
+    The tuple form is for a claim with several legitimate spellings — "this host reported a
+    failure" is true of four different messages, depending on which layer noticed first.
+    """
+    if isinstance(marker, tuple):
+        return any(alternative in logs for alternative in marker)
+    return marker in logs
+
+
 def wait_for_markers(name, markers, budget):
     """Poll `docker logs` until EVERY marker has appeared, or the budget runs out.
 
@@ -702,11 +754,27 @@ def wait_for_markers(name, markers, budget):
     deadline = time.monotonic() + budget
     while True:
         status, logs = docker(["logs", name], LOGS_TIMEOUT)
-        if status == 0 and all(marker in logs for marker in markers):
+        if status == 0 and all(satisfied(logs, marker) for marker in markers):
             return status, logs
         if time.monotonic() >= deadline:
             return status, logs
         time.sleep(BOOT_PAUSE)
+
+
+def host_failure_markers(address):
+    """Every line this service prints when ONE host does not answer, for that host.
+
+    Any one of them proves the host was reached for: src/proxmox.py stamps the host on both of its
+    error paths, and src/app.py stamps it on the two of its own. Which one appears depends on
+    nothing this gate controls — the startup fetch and the updater race, and either may be first —
+    so the requirement is the set rather than any single line.
+    """
+    return (
+        "[Proxmox] {}: failed to list nodes".format(address),
+        "[Proxmox] {}: failed to query cluster resources".format(address),
+        "[Proxmox] {}: initial domain fetch failed".format(address),
+        "[Proxmox] {}: cannot build the API client".format(address),
+    )
 
 
 def check_image_contract(image):
@@ -798,8 +866,9 @@ def check_config_guard(image, name):
         None if GUARD_MISSING_LINE in output else "the output does not contain it:\n{}".format(
             excerpt(output))))
     for variable in REQUIRED_VARIABLES:
-        # Each variable gets its own row: an operator who is told about one missing variable at a
-        # time comes back three times.
+        # A row per required variable. There is one of them today; the loop stays because the row it
+        # produces is the only one that says WHICH variable the guard named, and a guard that fires
+        # without naming it is a guard an operator has to read the source to act on.
         rows.append((
             "it names {} as missing".format(variable),
             None if variable in output else (
@@ -811,9 +880,11 @@ def check_config_guard(image, name):
 def start_serving_container(image, name):
     """Start the image with its REAL command and an unreachable PVE.
 
-    NO PORT IS PUBLISHED — see the module docstring. The container is given credentials pointing at
-    127.0.0.1 on purpose: that is the state the ensure_client() fix exists for, and the startup
-    markers below are the receipt that the fix is still in the image.
+    NO PORT IS PUBLISHED — see the module docstring. The container is given two PROXMOX_HOSTS
+    entries at two unroutable addresses on purpose: an unreachable host is the state the lazy
+    startup exists for, two of them is the shape the service actually runs in, distinct ones are
+    what check (l) can count, and the startup markers below are the receipt that all of it is
+    still survivable.
     """
     target = "`docker run -d` starts the image with its own command"
     remove_container(name)
@@ -831,8 +902,11 @@ def check_startup_markers(name, started):
     """(d) All three startup markers appear, with PVE unreachable.
 
     This is the regression check. Before ensure_client(), `build_client()` was the first statement of
-    run() and proxmoxer authenticates in its constructor — so with no PVE to reach, the process died
-    before any of these three lines was ever printed, and did so again on every restart.
+    run() and proxmoxer's password auth authenticated in its constructor — so with no PVE to reach,
+    the process died before any of these three lines was ever printed, and did so again on every
+    restart. Token auth has since moved the first network call to the startup fetch, which goes to
+    the same unreachable address; what these markers assert is unchanged, namely that nothing on the
+    way to the sockets waits for Proxmox to answer.
     """
     if not started:
         reason = "not attempted: the serving container never started"
@@ -853,6 +927,50 @@ def check_startup_markers(name, started):
                 "this far, which for the DNS line means the `.lc` zone resolves nowhere".format(
                     BOOT_BUDGET))))
     return rows, logs
+
+
+def check_every_host_is_polled(name, started, boot_logs):
+    """(l) EVERY configured host is really polled, not just the first one.
+
+    The service's whole shape is N independent hosts with a thread, a client and a slice of the
+    zone each. The cheapest way to break that is to stop walking the list — `_hosts[0]` instead of
+    `_hosts` — and the result looks perfectly healthy from everywhere else in this gate: the
+    process starts, both sockets bind, the status page answers, the log fills with failures from
+    the host that IS being polled. Only the absence of the OTHER host's name says anything, and
+    only because the two addresses differ.
+
+    It reads the log rather than asking the container anything, which is why the addresses have to
+    be distinct: what is being counted is host identities appearing in output the service itself
+    attributes.
+
+    `boot_logs` is the snapshot check (d) already paid for; on a healthy image both hosts have
+    failed long before the startup markers are printed, so the usual case costs no `docker logs`
+    call at all. The bounded wait is for the case where one host's failure genuinely arrives later.
+    """
+    targets = ["the log carries a failure attributed to the configured host {}".format(address)
+               for address in SERVE_HOSTS]
+    if not started:
+        reason = "not attempted: the serving container never started"
+        return [(target, reason) for target in targets]
+
+    requirements = [host_failure_markers(address) for address in SERVE_HOSTS]
+    logs = boot_logs or ""
+    if not all(satisfied(logs, requirement) for requirement in requirements):
+        status, logs = wait_for_markers(name, requirements, HOST_FAILURE_BUDGET)
+        if status is None:
+            reason = "not attempted: `docker logs` produced no exit code — {}".format(logs)
+            return [(target, reason) for target in targets]
+
+    rows = []
+    for target, address in zip(targets, SERVE_HOSTS):
+        rows.append((
+            target,
+            None if satisfied(logs, host_failure_markers(address)) else (
+                "nothing in the log names it within {} s, while the other configured host is all "
+                "over it. Every host is supposed to be polled on a thread of its own, so a host "
+                "that never appears is a host that is never asked — its guests would be missing "
+                "from the zone in production, silently and for ever".format(HOST_FAILURE_BUDGET))))
+    return rows
 
 
 def run_probe(name, started, program, timeout, marker, expected_targets, prefix, label):
@@ -1015,10 +1133,18 @@ def check_final_log(name, started):
     in this gate has run against the container since then, and a crash provoked by one of the probes
     would be invisible in the older copy.
 
-    One expected error line is NOT a traceback and is deliberately not treated as one: with PVE
-    unreachable, ensure_client() logs `[Proxmox] Cannot build the API client, will keep retrying`
-    once. That message is the fix working. A TRACEBACK, by contrast, means something escaped a
-    handler that was supposed to contain it.
+    Some expected error lines are NOT tracebacks and are deliberately not treated as such. With PVE
+    unreachable the log carries `[Proxmox] <host>: failed to list nodes` from the startup fetch and
+    then `[Proxmox] <host>: failed to query cluster resources` from the updater, once every couple
+    of seconds and once per configured host. Those messages are the degradation working — check (l)
+    above depends on them being there and on each one naming its own host.
+
+    NOTE THAT THE CLIENT-BUILD FAILURE IS NO LONGER AMONG THEM. It used to be the expected line here
+    — `[Proxmox] Cannot build the API client, will keep retrying` — because proxmoxer's password auth
+    authenticated inside the constructor. Token auth builds the client without touching the network,
+    so that line does not appear at all and the failure surfaces one layer later, on the first
+    request. A TRACEBACK, by contrast, means something escaped a handler that was supposed to
+    contain it.
     """
     target = "the serving container's final log is free of tracebacks"
     if not started:
@@ -1062,8 +1188,12 @@ def main():
         serve_rows, serve_started = start_serving_container(image, name + SERVE_SUFFIX)
         rows.extend(serve_rows)
 
-        marker_rows, _boot_logs = check_startup_markers(name + SERVE_SUFFIX, serve_started)
+        marker_rows, boot_logs = check_startup_markers(name + SERVE_SUFFIX, serve_started)
         rows.extend(marker_rows)
+
+        # Straight after the markers, and reusing their snapshot: by the time all three are
+        # printed the startup fetch has been out at both hosts and failed at both.
+        rows.extend(check_every_host_is_polled(name + SERVE_SUFFIX, serve_started, boot_logs))
 
         image_probe_rows, image_probe_output = run_probe(
             name + SERVE_SUFFIX, serve_started, IMAGE_PROBE, IMAGE_PROBE_TIMEOUT,

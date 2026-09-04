@@ -55,9 +55,12 @@ services:
     # blows through 10 s with only a couple of VMs. The container is then SIGKILLed on exit 137,
     # taking the authoritative server for the whole internal `example.lc` zone with it mid-redeploy.
     #
-    # 45 s is the CEILING, not a wait: src/app.py checks the shutdown flag between the steps of its
-    # startup sequence and the main loop waits on the Event, so an ordinary stop still returns in
-    # milliseconds. What this buys is that the slow case ends in a clean exit instead of a kill.
+    # 45 s is the CEILING, not a wait. src/app.py fetches the hosts on daemon threads and WAITS ON
+    # THE SHUTDOWN FLAG rather than on them, checks that flag again before it binds anything, and
+    # then waits on it in the main loop — so a stop is answered in milliseconds at every point after
+    # the handler is installed, whatever a PVE is doing. What this buys is the case none of that can
+    # help: a request already out at a black-holing host, which PEP 475 makes the process finish.
+    # The container then ends in a clean exit instead of a kill.
     stop_grace_period: 45s
     security_opt:
       # Forbids privilege escalation through setuid binaries. The container serves as the
@@ -83,11 +86,21 @@ services:
       - "53:53/udp"
       - "8076:80/tcp"        # HTTP status page: /, /json, /health
     environment:
-      # No defaults in code for these three: a missing one fails at startup with a message naming it,
-      # rather than starting up and serving an empty zone.
-      PROXMOX_HOST: XXX
-      PROXMOX_USER: XXX
-      PROXMOX_PASSWORD: XXX
+      # One entry per INDEPENDENT PVE host; a cluster is a single entry, because one endpoint
+      # answers for every node in it. API tokens only — a token is a header proxmoxer builds per
+      # request rather than a ticket it has to fetch and renew.
+      #
+      # No default in code and at least one entry required: a missing or empty variable fails at
+      # startup with a message naming it, rather than starting up and serving an empty zone. The
+      # same goes for a token that was created without an ACL of its own — see README.md; that one
+      # authenticates fine and answers with empty lists, which is why the service logs a warning
+      # when a host reports no nodes.
+      #
+      # A YAML block scalar so the JSON stays readable; it is one string by the time the container
+      # sees it. XXX everywhere, as in the header: these are placeholders, not a configuration.
+      PROXMOX_HOSTS: >-
+        [{"host": "pve1.example.lc", "user": "proxmoxdns@pve", "token_name": "dns", "token_value": "XXX"},
+        {"host": "pve2.example.lc", "user": "proxmoxdns@pve", "token_name": "dns", "token_value": "XXX"}]
       LOG_LEVEL: WARNING
       SUBDOMAINS: "true"
       # Without it the container runs on UTC and every log line is three hours off the clock of
