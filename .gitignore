@@ -14,5 +14,3 @@ logs/
 .aider*
 data/*
 !data/.gitkeep
-# Claude Code agent worktrees — never commit
-.claude/worktrees/
