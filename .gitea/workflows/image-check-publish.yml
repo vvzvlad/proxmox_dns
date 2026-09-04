@@ -127,9 +127,13 @@ jobs:
         # depends on tests/conftest.py's setdefault having been imported first. Passing it here
         # makes the suite independent of that ordering, exactly as the GHCR workflow this replaces
         # did with its `env:` block. Single-quoted so the shell hands the JSON over intact.
+        # TWO entries, matching tests/conftest.py: this value WINS over conftest's setdefault, and
+        # the suite asserts more than one host is configured — with a single entry a state built
+        # from all hosts is indistinguishable from one built from the first, so the multi-host
+        # regression this guards against would pass unnoticed. Do not collapse these back into one.
         tar --exclude=./.git --exclude=./.venv --exclude=./data --exclude=__pycache__ -cf - . \
           | docker run --rm -i --pull always --name "$SMOKE_NAME-tests" -w /w \
-              -e PROXMOX_HOSTS='[{"host": "test-host", "user": "test@pve", "token_name": "test", "token_value": "test-token"}]' \
+              -e PROXMOX_HOSTS='[{"host": "test-host-1", "user": "test@pve", "token_name": "dns", "token_value": "test-token-1"}, {"host": "test-host-2", "user": "test@pve", "token_name": "dns", "token_value": "test-token-2"}]' \
               python:3.11-slim bash -c '
           set -e
           tar -xf -
