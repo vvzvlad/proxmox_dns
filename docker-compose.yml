@@ -93,8 +93,9 @@ services:
       # No default in code and at least one entry required: a missing or empty variable fails at
       # startup with a message naming it, rather than starting up and serving an empty zone. The
       # same goes for a token that was created without an ACL of its own — see README.md; that one
-      # authenticates fine and answers with empty lists, which is why the service logs a warning
-      # when a host reports no nodes.
+      # authenticates fine and still sees every node, because /nodes is not permission-filtered,
+      # while every guest listing comes back empty. The service names that case in a warning
+      # reading "nodes are listed but NOT ONE guest came back".
       #
       # A YAML block scalar so the JSON stays readable; it is one string by the time the container
       # sees it. XXX everywhere, as in the header: these are placeholders, not a configuration.

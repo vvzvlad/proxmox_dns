@@ -179,9 +179,11 @@ independent user databases, so each one needs its own user, its own token and it
 ACLs.
 
 ```bash
-# 1. A user and a read-only role for it.
+# 1. A user and a read-only role for it. THE PRIVILEGE SET DEPENDS ON THE PVE VERSION —
+#    the line below is the PVE 9 one; see "The role is version-dependent" just after this
+#    block before running it on anything older.
 pveum user add proxmoxdns@pve
-pveum role add ProxmoxDNS --privs "VM.Audit,VM.Monitor"
+pveum role add ProxmoxDNS --privs "VM.Audit,VM.GuestAgent.Audit"
 pveum acl modify /vms --user proxmoxdns@pve --role ProxmoxDNS
 
 # 2. An API token for that user. THE TOKEN VALUE IS PRINTED ONCE AND NEVER AGAIN —
@@ -194,12 +196,138 @@ pveum user token add proxmoxdns@pve dns --privsep 1
 pveum acl modify /vms -token 'proxmoxdns@pve!dns' -role ProxmoxDNS
 ```
 
-Skipping step 3 does not produce an error anywhere. The token authenticates perfectly
-and every listing endpoint answers with an **empty list**, so the host silently
-contributes no names at all and the zone quietly shrinks. That is why the service logs
-a WARNING naming the host whenever a host reports no nodes — if you see it and the host
-does have VMs, this is the reason. (`--privsep 0` also works and skips step 3, at the
-price of a token that carries the user's full permissions.)
-
 Then put `host`, `user` (`proxmoxdns@pve`), `token_name` (`dns`) and the `token_value`
-from step 2 into that host's entry in `PROXMOX_HOSTS`.
+from step 2 into that host's entry in `PROXMOX_HOSTS`. The rest of this section is what
+goes wrong with the block above, and what the service can and cannot tell you about it.
+
+### The role is version-dependent
+
+`pveum role add` is all-or-nothing: one privilege it does not know makes it reject the
+WHOLE command — measured on PVE 9.2.10, where adding a role with
+`--privs "VM.Audit,VM.Monitor"` answers `400 Parameter verification failed.` /
+`privs: invalid format - invalid privilege 'VM.Monitor'`, exits `255`, and creates **no
+role at all**: the valid privilege alongside the bad one buys nothing, and the role is
+absent from `pveum role list` afterwards. Both `acl modify` lines that follow then fail in
+turn with `role 'ProxmoxDNS' does not exist`. So the set has to match the host's PVE major
+version — and `PROXMOX_HOSTS` is a list of independent machines that need not be on the
+same one:
+
+| PVE version | `--privs`                      |
+|-------------|--------------------------------|
+| 9 and newer | `VM.Audit,VM.GuestAgent.Audit` |
+| 8 and older | `VM.Audit,VM.Monitor`          |
+
+The guest-agent privilege was RENAMED rather than added, which is why neither name works
+on both. `GET /nodes/{node}/qemu/{vmid}/agent/network-get-interfaces` is declared
+`["perm", "/vms/{vmid}", ["VM.Monitor"]]` in the PVE 8 apidoc and
+`["perm", "/vms/{vmid}", ["VM.GuestAgent.Audit", "VM.GuestAgent.Unrestricted"], "any", 1]`
+in the PVE 9 one. Counted across those two documents: `VM.GuestAgent.Audit` appears 0
+times in PVE 8 and 14 times in PVE 9, `VM.Monitor` 28 times in PVE 8 and 0 times in PVE 9.
+`VM.Audit` is unchanged and required on both. (All four hosts this deployment talks to run
+PVE 9.x, so the block above is written for that.)
+
+On a host that was set up before this role gained the newer privilege, the role already
+exists and `pveum role add` refuses it — leaving the OLD privilege set in place, which is
+the failure this note exists to prevent. Also measured on PVE 9.2.10: a second
+`pveum role add` on a name that exists answers `create role failed: role '…' already
+exists` and exits `255`, and the role's privileges re-read afterwards are **unchanged** —
+the new `--privs` are simply discarded, so a run that scrolls past unnoticed leaves a role
+that looks configured and is not. Modify the role instead of adding it, with the set for
+that host's version, and leave the rest of the block alone (the user, the token and both
+ACLs are already there):
+
+```bash
+pveum role modify ProxmoxDNS --privs "VM.Audit,VM.GuestAgent.Audit"
+```
+
+### Skipping step 3: the host that goes silently empty
+
+Skipping step 3 does not produce an error anywhere, and — this is what makes it nasty —
+it does not even look broken. The token authenticates perfectly, and `GET /nodes` still
+answers **in full**, because the node index is served without any permission filtering.
+What goes empty are the permission-filtered listings: `nodes/<node>/qemu` and
+`cluster/resources` both hand back an **empty list**, so the host silently contributes no
+names at all and the zone quietly shrinks. The service catches it on exactly that shape —
+nodes listed, zero guests behind them — and logs a WARNING naming the host; if you see it
+and the host does have VMs, this is the reason. (`--privsep 0` also works and skips step
+3, at the price of a token that carries the user's full permissions.)
+
+On a multi-node cluster the line still fires when SOME node failed to answer, and names
+that node: what it did not answer says nothing about the nodes that did, and suppressing
+the diagnosis over one node being down is how a broken token stays undiagnosed for as
+long as the node stays down. The naming comes **before** the cause, and the cause is
+hedged to the nodes that did answer while a node is missing. Read the clause as it is
+written — that node's guests are unknown, so if the missing names live there, the token is
+not the fault.
+
+That WARNING is throttled to **at most once an hour per host**, so it is not in the last
+few screens unless you were unlucky. Nothing shortens that hour: the throttle is
+unconditional, so a host that recovers and breaks again within the hour stays quiet until
+the hour is out. The service is deployed as a **Portainer stack**, so read it there: open
+the container's log view, raise the line count well above whatever it tails by default,
+and search for `NOT ONE guest` — the colour escapes surround the whole message, so that
+plain substring matches. Do not count on the beginning of the log being available: the
+driver is `json-file` capped at `max-size: 10m` × `max-file: 5` — read off the running
+container with `docker inspect proxmox_dns --format '{{json .HostConfig.LogConfig}}'`,
+which answers `{"Type":"json-file","Config":{"max-file":"5","max-size":"10m"}}`. (Read
+from the container and not from `docker-compose.yml`, which this README declares is an
+illustration rather than the source of truth. The docker daemon's own default on that host
+is `8m` × `5`, so the stack does set these explicitly instead of inheriting them.) So a
+long-running container has already rotated its earliest lines away. That is not a problem
+in practice — the fault repeats for as long as it lasts, so if nothing is in the buffer
+yet, the next line lands within the hour.
+
+The line has two legitimate causes, and on a host with either of them it is expected and
+there is nothing to fix. A host running **only LXC containers** produces the same shape,
+because the service reads QEMU guests only and does not serve containers at all. So does
+a PVE with **no QEMU guests on it at all** — freshly installed, or emptied for the
+moment — for the plainer reason that there is genuinely nothing to list.
+
+### The other empty host: an address that is not a PVE
+
+A host that answers `GET /nodes` with an **empty list** is a different fault with a
+different fix, and it gets its own WARNING — grep the log for `NO nodes`. A running PVE
+always lists at least itself, so an empty node index means the address in `PROXMOX_HOSTS`
+reached something that is not a healthy PVE and answered anyway: a reverse proxy, another
+service on 8006, the wrong machine. Do **not** read it as the missing token ACL above —
+`/nodes` is not permission-filtered, so a token with no ACL at all still gets the full node
+list back, and `pveum acl modify` fixes nothing here. Check the address instead. Like the
+`NOT ONE guest` line, this one is throttled to **at most once an hour per host**; the two
+run on the same interval but on separate timers, so one of them firing never hides the
+other.
+
+### What each privilege in the role is for
+
+Both privileges in the role are load-bearing — do not trim the set down to the one that
+obviously belongs. `VM.Audit` is what makes guests visible at all: both the
+cluster-resource query the change detector runs every couple of seconds and the per-node
+guest listings behind the full walk are filtered by it. The guest-agent privilege
+(`VM.GuestAgent.Audit`, or `VM.Monitor` on PVE 8) is what allows the
+`network-get-interfaces` call, and that call is where the addresses actually come from:
+without it the names still resolve, to `0.0.0.0` and `::` for every guest, and the service
+cannot tell you — see "The failure this service CANNOT detect" below.
+
+`Sys.Audit` is deliberately NOT in the set. It looks like it should be — the service does
+call `GET /nodes` — but the node index is served without it: checked directly on PVE
+9.2.10 with a role carrying only the two privileges above, where the node listing, the
+per-node guest listing and the guest-agent call all worked. It could not have helped
+anyway: `GET /nodes` is not permission-filtered at all — on the same host, a token with
+not a single ACL granted to it still got the whole node list back.
+
+### The failure this service CANNOT detect
+
+The missing token ACL above leaves a signature, which is why there is a warning for it.
+**A missing guest-agent privilege leaves none**, and it matters more, because from every
+angle the service can see, the host looks healthy. With `VM.Audit` present and the
+guest-agent privilege absent, every guest lists normally, every name resolves, and every
+address comes back `0.0.0.0` / `::` — with **not one line in the log**. `get_vm_ip()` in
+`src/proxmox.py` catches the 403 as a `ResourceException` and returns those sentinels,
+which is exactly what it returns for a guest that has no agent installed at all. The
+service cannot tell the two apart, and it must not guess: this deployment legitimately
+runs four guests with no agent (Windows VMs and a RouterOS CHR), so a warning on the
+sentinels would be a permanent false alarm. Hence documented here rather than detected.
+
+**The symptom to look for** is one host on which EVERY guest resolves to `0.0.0.0` while
+the other hosts are fine. The `/` status table has a `Host` column, so that shows at a
+glance. A few `0.0.0.0` scattered across hosts are just guests without an agent; a whole
+host of them is the privilege.
