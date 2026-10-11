@@ -48,6 +48,23 @@ test: install ## Run the test suite (auto-creates .venv if missing)
 run: install ## Run the application (auto-creates .venv if missing)
 	$(PY) main.py
 
+# --- Proxmox -----------------------------------------------------------------
+# PVE 8 needs PVE_PRIVS=VM.Audit,VM.Monitor. A new token's value is printed only once and goes
+# into that host's PROXMOX_HOSTS entry.
+PVE_PRIVS ?= VM.Audit,VM.GuestAgent.Audit
+
+.PHONY: pve-setup
+pve-setup: ## Create the proxmoxdns user, role and API token on PVE=root@<host>
+	@test -n "$(PVE)" || { echo "usage: make pve-setup PVE=root@<host>" >&2; exit 1; }
+	ssh $(PVE) 'set -e; \
+		pveum role add ProxmoxDNS --privs $(PVE_PRIVS) \
+			|| pveum role modify ProxmoxDNS --privs $(PVE_PRIVS); \
+		pveum user add proxmoxdns@pve || true; \
+		pveum acl modify /vms --user proxmoxdns@pve --role ProxmoxDNS; \
+		pveum user token add proxmoxdns@pve dns --privsep 1 \
+			|| echo "token proxmoxdns@pve!dns already exists; its value is printed only on creation"; \
+		pveum acl modify /vms --token "proxmoxdns@pve!dns" --role ProxmoxDNS'
+
 # --- Housekeeping ------------------------------------------------------------
 .PHONY: clean
 clean: ## Remove the venv and Python caches
