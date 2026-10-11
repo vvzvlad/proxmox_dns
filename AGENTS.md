@@ -20,6 +20,7 @@ All routine actions go through the `Makefile` — run `make help` to list target
 ```bash
 make install           # create .venv and install dev/test deps
 cp .env.example .env   # then fill in the values  (shortcut: make env)
+make pve-setup PVE=root@<host>   # create the role, user, API token and ACLs on one PVE host
 ```
 
 ## Running tests
@@ -94,7 +95,7 @@ make run
   back a PARTIAL list instead, which the caller cannot tell from a complete one, so that node's
   guests leave the zone until it recovers. That predates multi-host support and was left alone
   on purpose; both candidate fixes (carrying the failed node's previous entries over, or
-  returning None) have costs of their own and belong in their own change. See the docstring.
+  returning None) have costs of their own and belong in their own change.
 - The status endpoints publish an EXPLICIT field list (`PUBLISHED_FIELDS` in
   `src/http_server.py`), not the entry dict: they are unauthenticated, and dumping the dict
   would put every field ever added to an entry on a public page.

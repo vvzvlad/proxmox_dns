@@ -1,6 +1,6 @@
 """Startup, shutdown and multi-host merge invariants of src/app.py.
 
-Thirty-three tests in four groups. Three of the first six — the two startup run() ones
+Thirty-four tests in four groups. Three of the first six — the two startup run() ones
 and the updater — defend ONE property, from three directions: whatever the
 Proxmox side does while the process is starting, the DNS and HTTP servers still
 come up. This service answers DNS for the whole internal `.lc` zone, so a startup
@@ -36,6 +36,9 @@ every `docker stop` sits out the whole 45 s this stack allows (see
 `stop_grace_period` in docker-compose.yml; docker's own default is 10 s) and
 ends in a kill instead of a clean exit. The handler and the interruptible wait
 are what turn that into a stop answered in milliseconds.
+
+The seventh pins the one startup log line about a host that shows no guests: an empty
+slice is named in one ERROR, a populated one draws none.
 
 The third group is the one that had to be written last and should have been written
 first: every test above it is satisfied by a SINGLE host, because _isolate_module_state()
@@ -719,6 +722,28 @@ def test_updater_retries_a_failed_client_and_fills_the_zone_once_pve_answers(mon
         f"the zone was not refreshed once PVE answered: {state.servers_list!r}")
 
 
+def test_the_startup_fetch_names_a_host_that_shows_no_guests(monkeypatch, caplog):
+    """An empty startup slice draws one ERROR naming the host; a slice with guests draws none."""
+    hosts = _isolate_module_state(monkeypatch)
+    monkeypatch.setattr(app, "build_client", lambda _cfg: object())
+    monkeypatch.setattr(app, "get_domains", lambda _proxmox, _host: [])
+
+    with caplog.at_level("ERROR"):
+        assert app._initial_fetch(hosts[0]) == []
+    errors = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
+    assert len(errors) == 1 and "pve1.test" in errors[0], (
+        f"a host that showed no guests at startup was not named in exactly one ERROR: {errors}")
+
+    caplog.clear()
+    entries = [_entry("foo.lc", "pve1.test")]
+    monkeypatch.setattr(app, "get_domains", lambda _proxmox, _host: list(entries))
+
+    with caplog.at_level("ERROR"):
+        assert app._initial_fetch(hosts[0]) == entries
+    errors = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
+    assert errors == [], f"a host with guests drew an ERROR at startup: {errors}"
+
+
 # --- Every configured host, not just the first one ------------------------------------
 # The group that has to exist because everything above it can be satisfied by ONE host.
 # _isolate_module_state() installs a single host by default, so a run() test says nothing
@@ -1183,11 +1208,10 @@ def test_a_host_whose_fetch_failed_in_time_is_not_named_in_the_deadline_warning(
     INITIAL_FETCH_DEADLINE seconds. That is the whole damage, and none of it shows in the
     zone: measured, the mutation takes this test down and nothing else in the suite.
 
-    The cost is paid by whoever reads the log. A revoked token, or one the privsep step in
-    the README never gave an ACL to, fails fast and says so in an ERROR of its own. Stacking
-    "no answer within 10 s" on top of that line contradicts it, and the false half is the
-    one that points at the network and at timeouts rather than at the ACL the true half
-    names.
+    The cost is paid by whoever reads the log. A revoked token fails fast and says so in an
+    ERROR of its own. Stacking "no answer within 10 s" on top of that line contradicts it,
+    and the false half is the one that points at the network and at timeouts rather than at
+    the credential the true half names.
 
     pve1 fails at once and well inside the deadline; pve2 answers normally. Nothing here is
     late, so the warning must not be produced at all.
@@ -1197,7 +1221,7 @@ def test_a_host_whose_fetch_failed_in_time_is_not_named_in_the_deadline_warning(
 
     def pve1_says_at_once_that_its_token_is_no_good(_proxmox, host):
         if host == "pve1.test":
-            raise RuntimeError("authentication failure: no ACL for dns@pve")
+            raise RuntimeError("401 Unauthorized: invalid API token")
         return [_entry("two.lc", "pve2.test", vmid=202, ipv4="10.0.0.6")]
 
     monkeypatch.setattr(app, "get_domains", pve1_says_at_once_that_its_token_is_no_good)

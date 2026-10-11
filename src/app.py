@@ -381,12 +381,18 @@ def _initial_fetch(host):
     if proxmox is None:
         return None
     try:
-        return get_domains(proxmox, host.cfg.host)
+        domains = get_domains(proxmox, host.cfg.host)
     except Exception as e:
         logger.error(
             f"[Proxmox] {host.cfg.host}: initial domain fetch failed, "
             f"starting without its names: {e}")
         return None
+    # A token without its own ACL sees the nodes but gets no guests, and nothing raises.
+    if domains == []:
+        logger.error(
+            f"[Proxmox] {host.cfg.host}: no QEMU guests visible at startup; if the host has "
+            "VMs, its API token lacks the ACL (make pve-setup)")
+    return domains
 
 
 def initial_domains():
