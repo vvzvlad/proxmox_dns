@@ -1,21 +1,13 @@
 """What src/proxmox.py has to hand back for the merge to work, and the silent failures.
 
-Two things are pinned here.
+Every entry carries `host`, `vmid` and `status`, which src/app.py's merge ranks a
+collision on, on all four return paths of get_vm_ip() (stopped guest, successful read,
+two except branches). An entry missing `status` would silently lose a collision.
 
-EVERY entry carries where it came from. `host`, `vmid` and `status` are what
-src/app.py's merge ranks a collision on, and get_vm_ip() returns from four places —
-the stopped guest, the successful read, and two except branches. An entry that lost
-`status` on one of those paths cannot be ranked as running and would quietly lose a
-collision it should have won, which is the sort of bug that shows up as one VM being
-unreachable by name and nothing in the log at all.
-
-AND A PARTIAL ANSWER IS STILL AN ANSWER, which is the behaviour rather than the ideal.
-On a multi-node cluster one node's guest list can fail while the others succeed, and
-what comes back is a list short by that node's guests, indistinguishable from a complete
-one. The test below pins that as it stands — it predates multi-host support and this
-change deliberately left it alone — so that whoever changes it does so knowingly and not
-by accident. Only the NODE LISTING failing gives back None, the caller's "keep the slice
-you have" signal.
+A partial answer is still an answer: when one node's guest list fails on a multi-node
+cluster, the result is short by that node's guests and indistinguishable from a complete
+one. Pinned as current behaviour so a change to it is deliberate. Only the node listing
+failing returns None, the caller's "keep the slice you have" signal.
 """
 
 from src import proxmox
@@ -145,19 +137,14 @@ def test_every_node_of_a_cluster_contributes_its_guests():
 def test_one_node_failing_costs_only_that_node_and_is_logged(caplog):
     """One node of a cluster failing does NOT abandon the other nodes' guests.
 
-    This pins behaviour that predates multi-host support and that this change left
-    alone on purpose. The healthy node's guests come through; the failed node's are
-    simply absent, and the caller — which cannot tell this list from a complete one —
-    publishes it, so those names leave the zone until the node answers again. The
-    per-node ERROR asserted here is the only thing that says so, which is why it has
-    to name the node.
+    The healthy node's guests come through; the failed node's are absent, and the caller
+    publishes the list, so those names leave the zone until the node answers. The
+    per-node ERROR is the only signal, so it must name the node.
 
-    A fix belongs in its own change, on its own evidence: neither candidate is free.
-    Carrying the failed node's previous entries over serves records nothing has
-    confirmed, with no rule for when to drop them; returning None instead freezes the
-    host's healthy nodes for the whole outage AND, since the caller only advances its
-    refresh bookkeeping after a successful fetch, turns the once-a-minute full walk
-    into one every couple of seconds — a guest-agent call per VM each time.
+    Neither alternative is free: carrying the failed node's previous entries serves
+    unconfirmed records, and returning None freezes the healthy nodes and, since the
+    caller advances its refresh bookkeeping only after a successful fetch, turns the
+    once-a-minute full walk into one every couple of seconds.
     """
     cluster = _Cluster({
         "pve1": _Node(_Qemu([RUNNING_VM], AGENT_ANSWER)),

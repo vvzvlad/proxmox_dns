@@ -1,85 +1,28 @@
 """Startup, shutdown and multi-host merge invariants of src/app.py.
 
-Thirty-four tests in four groups. Three of the first six — the two startup run() ones
-and the updater — defend ONE property, from three directions: whatever the
-Proxmox side does while the process is starting, the DNS and HTTP servers still
-come up. This service answers DNS for the whole internal `.lc` zone, so a startup
-that dies before those two threads exist does not degrade the zone — it removes
-it, and because docker restarts the container it does so in a loop.
+Startup: whatever the Proxmox side does while the process starts, the DNS and HTTP
+servers still come up. The service is authoritative for the internal `.lc` zone, and a
+startup that dies before those threads exist becomes a restart loop. With token auth the
+first network call is initial_domains(), one per configured host, so that is where these
+tests put a failing PVE.
 
-The restart policy is `always` rather than `unless-stopped`, and that is a
-behavioural choice, not a spelling. The two differ in one case: a container an
-operator stopped ON PURPOSE. `unless-stopped` remembers that stop across a
-restart of the docker daemon and leaves it down; `always` brings it back by
-itself. For the authoritative server of the `.lc` zone that is what is wanted —
-a rebooted host must resolve names again unattended — at the accepted price that
-a deliberate stop only holds until the daemon next restarts. The full note is on
-ensure_client() in src/app.py.
+Shutdown: `docker stop` stops the process. In the container python is PID 1, which has no
+default signal dispositions, so the tests check that the handler is installed, a stop during
+startup is acted on before anything binds, and the reporting loop returns as soon as the
+handler fires.
 
-The startup property is easy to lose because the Proxmox side is reached on the
-way to those threads at all. It used to be lost in the CONSTRUCTOR: with password
-auth proxmoxer posts to /access/ticket from inside ProxmoxAPI(), so build_client()
-was itself a network call. Token auth moved that — proxmoxer only stores the token
-and assembles a header per request — so the first network call is now
-initial_domains(), one per configured host, and that is what these tests put a
-failing PVE in front of.
+Multi-host: _isolate_module_state() installs one host by default, so these tests configure
+two and assert what only a run over both produces: an updater per host, a startup fetch that
+survives the first host failing and runs hosts concurrently, `_hosts` built from every
+PROXMOX_HOSTS entry, the harvest (zone published with no answers; an answer in its slot is
+harvested before its fetch thread finishes; late hosts named in the warning, failed ones
+not), and late answers published but never over the host's own updater. Pre-fill assertions
+read state.servers_list, since initial_domains() returns nothing.
 
-The next three tests are the other end of the process's life: that `docker stop`
-actually stops it — the handler is installed, a stop that lands during startup is
-acted on before anything binds, and the reporting loop returns the moment the
-handler fires. In the container python is PID 1, and PID 1 is given NO
-default signal dispositions by the kernel — an unhandled SIGTERM there is
-dropped rather than applied. A container in that state does not go dark: it
-keeps answering `.lc` queries right through the grace period and is then
-SIGKILLed on exit 137. What that costs is the redeploy rather than the zone —
-every `docker stop` sits out the whole 45 s this stack allows (see
-`stop_grace_period` in docker-compose.yml; docker's own default is 10 s) and
-ends in a kill instead of a clean exit. The handler and the interruptible wait
-are what turn that into a stop answered in milliseconds.
-
-The seventh pins the one startup log line about a host that shows no guests: an empty
-slice is named in one ERROR, a populated one draws none.
-
-The third group is the one that had to be written last and should have been written
-first: every test above it is satisfied by a SINGLE host, because _isolate_module_state()
-installs one by default. Three separate ways of quietly polling only `_hosts[0]` passed
-the whole suite. Those tests configure two hosts and assert something only a run over
-both of them can produce — an updater per host, a startup fetch that survives the FIRST
-host failing and that runs the hosts concurrently rather than in turn, and a `_hosts`
-built from every entry of PROXMOX_HOSTS. Two of them are about the host that answers
-LATE, on either side of one rule: its answer is published rather than discarded, but
-never over something that host's own updater has published in the meantime.
-
-Every test in that group THAT ASSERTS ON THE PRE-FILL reads state.servers_list, and none
-of them reads a return value, because initial_domains() hands nothing back: it PUBLISHES,
-and the write inside it is the only path by which the pre-fill reaches the list the DNS
-server answers from. Two of the group assert nothing about the zone, and for two
-different reasons. The one that counts the HostStates against PROXMOX_HOSTS is the only
-test here that never reaches initial_domains() at all. The updater-per-host one does
-reach it — it calls run(), so the pre-fill runs and publishes, over a get_domains()
-patched to answer `[]` — but what it is about is the threads started around that call,
-so it looks at the updaters and not at the zone they refresh. Four of the group are about
-the harvest itself: the zone is published even when NO host answers; an answer that
-reached its slot is harvested even though its fetch thread has not finished, which is a
-window a harvest keyed on the fetch's done Event used to drop the host's answer in
-altogether; a host that really has not answered when the deadline fires IS named in the
-warning, which is what keeps the two tests asserting the ABSENCE of that warning from
-passing on a warning that no longer exists; and a host whose fetch FAILED in time is not
-also reported as having missed the deadline, which the harvest can only tell apart
-because a slot starts at a `pending` sentinel rather than at the None a failure stores.
-
-The last group is the multi-host merge. The service polls N INDEPENDENT PVE hosts,
-each on its own thread and each holding its own last-known slice of the zone, and
-merge_domains() is what turns those slices into the one list the DNS server reads.
-Five properties are worth pinning there: a name served by two hosts resolves to the
-guest that is actually RUNNING; a host that stops answering costs its own freshness
-and nothing else — neither its own records nor anybody else's; a name claimed twice
-ON ONE HOST is not that collision at all and keeps BOTH entries, because dropping one
-takes its address out of the zone and its PTR answer with it; one address arriving
-from two hosts is reported rather than resolved, since both A records are right and
-only the reverse lookup is ambiguous; and, within a name, the entries come out BEST
-FIRST — src/dns_server.py answers with the first match, so choosing the right host and
-then listing its stopped guest ahead of its running one serves the 0.0.0.0 sentinel.
+Merge: a name served by two hosts resolves to the running guest; a silent host keeps its own
+records and nobody else's change; a name claimed twice on one host keeps both entries (PTR
+needs the address); one address from two hosts is reported, not resolved; within a name the
+best entry comes first, since src/dns_server.py answers with the first match.
 """
 
 import signal
@@ -94,27 +37,20 @@ from src.settings import ProxmoxHost, settings
 # How long to wait for a server thread to report in. Generous: it only has to
 # cover thread scheduling, and a failing run pays this once.
 STARTUP_WAIT = 5.0
-# The same, for run() coming back after the shutdown Event is set. A regression
-# to a bare time.sleep(30) shows up as this bound expiring.
+# The same, for run() coming back after the shutdown Event is set.
 SHUTDOWN_WAIT = 5.0
-# How long the startup fetches are given to meet each other at a rendezvous. Only a
-# sequential fetch ever spends it: the first call sits here for the whole bound with
-# nobody coming to meet it, and the test then fails on the names that went missing
-# rather than on the clock.
+# How long the startup fetches are given to meet at a rendezvous. Only a sequential fetch
+# spends it; the test then fails on the missing names.
 RENDEZVOUS_WAIT = 5.0
-# What "the startup fetch gave up promptly" means, against app.INITIAL_FETCH_DEADLINE.
-# It has to be well under that deadline, or a fetch that simply ran the deadline out
-# would satisfy it and the test would prove nothing about the shutdown at all.
+# What "the startup fetch gave up promptly" means; well under app.INITIAL_FETCH_DEADLINE
+# so that running the deadline out does not satisfy it.
 ABANDON_WAIT = 3.0
-# The hard bound on every Event a fake PVE blocks on to stand in for a host that never
-# answers. A correct run never reaches it — the test has already made its assertion and
-# moved on — so it is not a timing budget but a fuse: a wait with no bound at all leaves
-# a wedged thread alive for as long as the interpreter is, and a regression that stops
-# the test from releasing it turns into a suite that never finishes rather than one that
-# fails. Long enough that a loaded runner cannot reach it by being slow.
+# Hard bound on every Event a fake PVE blocks on to stand in for a host that never answers.
+# A fuse, not a budget: a correct run never reaches it, and it turns a regression into a
+# failure instead of a suite that never finishes.
 BLACK_HOLE_BOUND = 30.0
-# How long a startup fetch thread that answered after the deadline is given to publish
-# on its own. It is a thread hand-off, not work, so this is slack rather than a budget.
+# How long a late startup fetch thread is given to publish on its own; slack for a thread
+# hand-off.
 LATE_PUBLISH_WAIT = 5.0
 
 
@@ -137,10 +73,8 @@ def saved_signal_handlers():
 class _StopLoop(BaseException):
     """Sentinel used to unwind the infinite loops in src/app.py.
 
-    Derived from BaseException RATHER THAN Exception on purpose: start_thread()
-    catches Exception to restart a crashed server, so a normal exception would be
-    swallowed and the thread would immediately spin the loop again. BaseException
-    passes through it and lets a test end the loop it is driving.
+    Derived from BaseException because start_thread() catches Exception and would
+    restart the loop.
     """
 
 
@@ -169,17 +103,10 @@ class _FakeClock:
     def monotonic(self):
         """The third function src/app.py asks the `time` module for. NOT faked.
 
-        initial_domains() builds its deadline out of it, and a deadline measured on
-        the frozen clock above can never expire: `remaining` would stay at its initial
-        value for ever, so a fetch that stopped returning would park the wait loop
-        permanently and — in the two tests that call run() on the main thread — take
-        the whole suite with it. There is no pytest-timeout in this project, so that
-        is a hang with nothing to end it.
-
-        The real clock costs these tests nothing: none of them is about the startup
-        fetch running out of time, and every fetch they install answers in
-        microseconds against a 10 s deadline. What it buys is that a regression here
-        FAILS, at INITIAL_FETCH_DEADLINE, instead of hanging.
+        initial_domains() builds its deadline from it, and on a frozen clock the
+        deadline never expires, so a fetch that stopped returning would hang the suite
+        (there is no pytest-timeout). The fetches here answer in microseconds, so the
+        real clock costs nothing and a regression fails at INITIAL_FETCH_DEADLINE.
         """
         return time.monotonic()
 
@@ -187,48 +114,15 @@ class _FakeClock:
 class _ClockThatExpiresOnceTheFetchIsParked:
     """`time.monotonic()` for initial_domains(), driven by an Event instead of by a clock.
 
-    The startup wait ends when every fetch has set its done Event or when the deadline
-    expires, and one test below needs it to end at a THIRD moment: the instant a fetch
-    thread is parked between writing its slot and setting that Event. Reading the real
-    clock there would mean choosing a deadline short enough to expire before the fetch
-    could reach the window and long enough that a loaded runner could still get there in
-    time — a flake whichever way it is rounded.
+    One test needs the startup wait to end at the instant a fetch thread is parked
+    between writing its slot and setting its done Event; a real-clock deadline would be
+    a flake either way it is tuned. monotonic() stands still until the fetch is parked,
+    then advances by more than the deadline on every call, so the wait gives up on its
+    next look whichever side of the deadline computation the parking landed on.
 
-    So the deadline is expired by the EVENT. monotonic() stands still until the fetch is
-    parked, and from then on it ADVANCES BY MORE THAN THE DEADLINE ON EVERY CALL — which
-    is what makes it safe rather than merely convenient. initial_domains() builds its
-    deadline out of this same clock, so a version that simply jumped to a fixed value
-    would leave the deadline unreachable whenever the fetch parked before that line ran,
-    and the wait would poll for ever. Advancing every time, the wait gives up on its
-    first look at the clock after the window opens, whichever side of the deadline
-    computation the parking landed on. It can only ever end the wait, never extend it.
-
-    IT IS ALSO BOUNDED IN REAL TIME, like every other black hole in this file, and that
-    is the fuse rather than a budget. What it saves the suite from is a FETCH THAT NEVER
-    RETURNS: nothing parks, so this clock never starts moving and the deadline can never
-    expire, and `done` is never set either, so the wait loop's other exit is closed as
-    well — it polls for ever. There is no pytest-timeout in this project, so that is a
-    hang with nothing to end it. After BLACK_HOLE_BOUND real seconds the clock therefore
-    advances regardless of the Event: the wait gives up, the harvest runs without the
-    window ever having opened, and the test fails inside _join_the_startup_fetch_of()
-    with "still running 5.0 s after it was released" — the fetch thread being, by
-    construction, exactly that — instead of wedging the suite.
-
-    The parking machinery breaking is NOT what this fuse is for. Break what the LOCK reads
-    on its way out — rename the fetch threads, or swap the `answered` Event — and `__exit__`
-    stops recognising the release: the fetch runs on to its `finally` and sets `done`, the
-    wait loop leaves by that exit without entering its body once, and the test fails on
-    `assert parked.is_set()` in single-digit milliseconds. Both halves of that measured.
-
-    Swapping the `parked` Event THIS clock reads is the other direction, and this fuse is
-    not what that case is FOR either. The fetch parks as before and the clock never starts, so
-    nothing ends the wait until one of TWO BLACK_HOLE_BOUND budgets expires: this clock's,
-    or the `proceed.wait(BLACK_HOLE_BOUND)` inside the park itself. They are the same bound
-    and the order between them is decided by INITIAL_FETCH_POLL, so build nothing on it — when
-    it was measured the park won (released at 30.005 s, the next clock sample not due until
-    ~30.03 s), the fetch ran on, `done` was set, and the wait left by the `done` exit with
-    the thread already finished. Either way the test passes a BLACK_HOLE_BOUND slowly rather
-    than hanging, and neither case is the hang the paragraph above is about.
+    Also bounded in real time: if the fetch never parks, after BLACK_HOLE_BOUND seconds
+    the clock advances anyway, and the test fails in _join_the_startup_fetch_of()
+    instead of hanging the suite (there is no pytest-timeout).
     """
 
     def __init__(self, parked):
@@ -248,28 +142,17 @@ class _ClockThatExpiresOnceTheFetchIsParked:
 class _LockThatParksAFetchOnItsWayOut:
     """src/app.py's `_publish_lock`, plus the window one test below is about.
 
-    A startup fetch writes its slot INSIDE the lock and sets its done Event in a
-    `finally`, AFTER releasing it. This stands in for the lock and holds the fetch thread
-    in exactly that gap: the slot is written, the lock is free for the harvest to take,
-    and `done` is still unset. Only fetch threads are held — initial_domains() names them
-    after the host they fetch, which is what makes them recognisable from in here — so
-    the harvest itself passes straight through.
+    A startup fetch writes its slot inside the lock and sets its done Event in a
+    `finally` after releasing it. This holds the fetch thread in that gap: slot written,
+    lock free for the harvest, `done` unset. Only fetch threads are held (recognised by
+    the `initial-fetch(` thread name), so the harvest passes through.
 
-    WHICH release to park on is decided by `answered` rather than by parking on any of
-    them. The test's get_domains() sets that Event as it returns, and the slot write is
-    the first thing the fetch does under this lock afterwards, so the first release seen
-    with it set is the one that carries the slot. Parking on ANY release is right only
-    for as long as fetch() takes this lock exactly once: add a read under _publish_lock
-    inside ensure_client() or _initial_fetch() and the thread would park BEFORE its slot
-    was written, the clock would unfreeze, the harvest would find `pending`, and the test
-    would fail with a message blaming a done Event that had nothing to do with it. Only
-    the FIRST qualifying release parks, so a fetch that takes the lock again afterwards
-    is not held a second time. The test that uses this configures ONE host, so the Event
-    is set and read on the same thread and cannot describe some other host's fetch.
+    It parks on the first release after `answered` is set (the test's get_domains()
+    sets it as it returns), which is the release that carries the slot write; parking
+    on any release would break if fetch() took this lock more than once. The test uses
+    one host, so the Event cannot describe another host's fetch.
 
-    A plain object rather than a Lock subclass: `with` needs nothing but these two
-    methods, and wrapping a real Lock keeps the mutual exclusion the production code is
-    entitled to while adding the hold on the way out.
+    Wraps a real Lock, so mutual exclusion is preserved.
     """
 
     def __init__(self, parked, proceed, answered):
@@ -296,12 +179,9 @@ class _LockThatParksAFetchOnItsWayOut:
 class _RecordingEvent(threading.Event):
     """A shutdown Event that says whether run()'s REPORTING LOOP ever waited on it.
 
-    TWO places in src/app.py wait on this object, which is why the timeout is
-    inspected rather than the call merely counted: the reporting loop waits for
-    REPORT_INTERVAL, and initial_domains() waits for INITIAL_FETCH_POLL on every pass
-    of its startup wait. Recording any wait at all would make `waited` a claim about
-    whichever of the two happened to run — and it would pass on a run() that never
-    reached the loop, which is exactly the thing the flag exists to rule out.
+    Two places wait on it: the reporting loop for REPORT_INTERVAL and initial_domains()
+    for INITIAL_FETCH_POLL. Only the former sets `waited`, so the flag cannot pass on a
+    run() that never reached the loop.
 
     Everything else behaves exactly as threading.Event does.
     """
@@ -309,8 +189,7 @@ class _RecordingEvent(threading.Event):
     def __init__(self):
         super().__init__()
         self.waited = threading.Event()
-        # Every timeout seen, so a test that ends up asserting on this can say what
-        # it actually observed instead of "the loop was not reached".
+        # Every timeout seen, for the failure message.
         self.timeouts = []
 
     def wait(self, timeout=None):
@@ -329,22 +208,16 @@ def _host_state(name):
 def _isolate_module_state(monkeypatch, host_names=("pve1.test",)):
     """Reset the per-host states, the zone and the shutdown flag src/app.py keeps at module level.
 
-    monkeypatch restores all of them afterwards, so one test's client cannot leak
-    into the next one's ensure_client() and make a retry look like a success —
-    and a test that sets the shutdown Event hands the next one a fresh, unset
-    Event rather than a process that is already supposed to be stopping.
-
-    The real `_hosts` is built from PROXMOX_HOSTS at import time; replacing it is
-    also how a test chooses how many hosts it is exercising. Returns the list, in
-    PROXMOX_HOSTS order — which is the order merge_domains() breaks ties in.
+    monkeypatch restores them afterwards, so one test's client or shutdown Event
+    cannot leak into the next. Replacing `_hosts` (built from PROXMOX_HOSTS at import)
+    is also how a test chooses how many hosts it exercises. Returns the list in
+    PROXMOX_HOSTS order, the merge tie-break order.
     """
     hosts = [_host_state(name) for name in host_names]
     monkeypatch.setattr(app, "_hosts", hosts)
     monkeypatch.setattr(app, "_shutdown", threading.Event())
     monkeypatch.setattr(app, "_shutdown_signal", None)
-    # A fresh list rather than the module's own: publish_domains() REBINDS
-    # state.servers_list, so a test reads it back through the module rather than
-    # holding on to the object it started with.
+    # publish_domains() rebinds state.servers_list, so tests read it through the module.
     monkeypatch.setattr(state, "servers_list", [])
     return hosts
 
@@ -352,36 +225,21 @@ def _isolate_module_state(monkeypatch, host_names=("pve1.test",)):
 def _parked_target(reported=None, then_stop=False):
     """A stand-in for one of the three loops run() hands to a thread.
 
-    Sets `reported` if given, then blocks forever — which is what the real
-    targets do, since the UDP loop, serve_forever() and the updater's `while
-    True` never return. Returning instead would send start_thread() straight back
-    round its own `while True` and spin the CPU. The thread is a daemon parked on
-    an Event, so it costs nothing and dies with the interpreter.
+    Sets `reported` if given, then blocks forever like the real targets; returning
+    would make start_thread() spin. The thread is a daemon parked on an Event.
 
-    The updater gets one of these too, in ALL FIVE of the run() tests below —
-    none of them is about the updater, which has its own test at the bottom of
-    this file. In the four that install a _FakeClock, letting the real updater
-    run would put that clock on a second thread, where its _StopLoop would
-    surface as an unhandled exception in a thread rather than as anything the
-    test asserts. The fifth — the main-loop one — never patches `app.time` at
-    all, and there the parking is simpler than that: it keeps the real updater,
-    with its real sleeps and its real calls to PVE, from running.
+    The run() tests park the updater too: with a _FakeClock installed, the real updater
+    would raise _StopLoop on a second thread; without one, it would make real calls.
 
-    `then_stop` sets the module's shutdown Event once this target is reached, and
-    it is how the run() tests below get run() to come back instead of sitting in
-    its reporting loop. Asking for the stop from INSIDE a thread run() started is
-    the only way to say "the stop arrived AFTER startup". Setting the Event before
-    calling run() would say something else entirely — a stop that arrived DURING
-    startup, which run() now answers by returning before it binds anything — and
-    those tests would then be green or red on a branch that is not the one they
-    are about. `app._shutdown` is looked up at call time because
-    _isolate_module_state() has replaced it with a fresh Event.
+    `then_stop` sets the shutdown Event once this target is reached, which is how a
+    test says "the stop arrived after startup". Setting it before run() would take
+    run()'s early-return path instead. `app._shutdown` is looked up at call time
+    because _isolate_module_state() replaced it.
     """
     parked = threading.Event()
 
     def target(*_args):
-        # *_args because the updater target is called with the host it polls, while
-        # the two server targets take nothing. One stand-in stands in for both.
+        # *_args: the updater target takes the host, the server targets nothing.
         if reported is not None:
             reported.set()
         if then_stop:
@@ -394,30 +252,15 @@ def _parked_target(reported=None, then_stop=False):
 def _run_on_a_worker_thread():
     """Start run() on a daemon thread and hand back the Event that says it returned.
 
-    NO TEST IN THIS FILE MAY CALL run() ON THE MAIN THREAD WHILE ITS REPORTING LOOP
-    IS REACHABLE. That loop is `while not _shutdown.wait(REPORT_INTERVAL)`, and the
-    only thing that ends it is the Event being set from one of the threads run()
-    started. When that signal does not arrive — the thread was never started, the
-    startup order moved, the target raised and start_thread() swallowed it — the
-    loop simply waits again, forever, and a main-thread call takes the whole suite
-    with it. There is no timeout anywhere on that path and pytest-timeout is not a
-    dependency of this project.
+    run() must not be called on the main thread while its reporting loop is reachable:
+    only an Event set from one of run()'s threads ends it, and if that never happens a
+    main-thread call hangs the suite (there is no pytest-timeout). On a daemon thread
+    every claim is a bounded Event wait and the worker dies with the interpreter.
 
-    On a DAEMON thread the same failure is bounded by construction: the test keeps
-    the main thread, every claim it makes is an Event wait with a deadline on it,
-    and the worker dies with the interpreter whether or not it ever came back. The
-    price is that run() cannot install signal handlers there — signal.signal()
-    raises ValueError off the main thread, which install_signal_handlers() catches
-    and warns about — so a test using this helper says nothing about handlers and
-    needs no fixture to undo one. Two tests still call run() DIRECTLY, and only one
-    of them has to: the handler test reads signal.getsignal() afterwards, a claim
-    that can only be made where signal.signal() was allowed to work. The other —
-    the one about a stop that arrived during startup — asserts only that three
-    targets are never reached, which a worker thread would show just as well; it
-    takes saved_signal_handlers to undo the handlers run() installs on its way past,
-    not because the handlers are what it is about. Both set the shutdown Event
-    before run() gets past initial_domains(), so run() there leaves by its early
-    return and the loop above is never reached at all.
+    Off the main thread signal.signal() raises ValueError (install_signal_handlers()
+    catches it), so tests using this helper say nothing about handlers. The two tests
+    that call run() directly set the shutdown Event before run() passes
+    initial_domains(), so they leave by the early return.
     """
     returned = threading.Event()
 
@@ -432,16 +275,8 @@ def _run_on_a_worker_thread():
 def test_run_starts_dns_and_http_when_the_proxmox_client_cannot_be_built(monkeypatch):
     """The regression: a client that cannot be built at startup must still leave the zone served.
 
-    Before ensure_client(), run() called build_client() on its first line, and with
-    password auth that call authenticated — so a PVE that was down raised straight
-    out of run(), before any of the three threads existed. The process died, the
-    container restarted, and it died again: `.lc` resolved nowhere for as long as
-    PVE was down.
-
-    Token auth means the constructor no longer talks to anything, so what reaches
-    ensure_client() now is a configuration fault rather than a dead host. The
-    contract it has to keep is the same either way and is what this pins: it
-    returns None, and startup carries on.
+    ensure_client() must return None on a configuration fault and startup must carry
+    on; otherwise run() dies before any thread exists and the container restart-loops.
     """
     dns_started = threading.Event()
     http_started = threading.Event()
@@ -452,23 +287,15 @@ def test_run_starts_dns_and_http_when_the_proxmox_client_cannot_be_built(monkeyp
     _isolate_module_state(monkeypatch)
     monkeypatch.setattr(app, "build_client", client_that_cannot_be_built)
     monkeypatch.setattr(app, "start_dns_server", _parked_target(dns_started))
-    # The stop is asked for from inside the LAST thread run() starts, so the first
-    # wait() in run()'s reporting loop returns at once and run() comes back
-    # instead of blocking for REPORT_INTERVAL. It has to arrive from there rather
-    # than before the call: a stop already pending when run() begins is a
-    # different case, which run() answers by returning before it starts anything.
-    # See _parked_target(). _isolate_module_state() put a fresh Event on the
-    # module, so this cannot leak into another test.
+    # The stop is asked for from inside the last thread run() starts, so the reporting
+    # loop returns at once. A stop pending before run() would take the early-return path
+    # instead (see _parked_target()).
     monkeypatch.setattr(app, "start_http_server",
                         _parked_target(http_started, then_stop=True))
     monkeypatch.setattr(app, "update_dns_periodically", _parked_target())
-    # A clock that refuses to sleep, kept as a WATCHDOG rather than as the thing
-    # driving the test: run()'s reporting loop waits on the Event now and must
-    # never sleep again. A loop mutated back to time.sleep() raises _StopLoop out
-    # of run() on the worker thread rather than napping, so `returned` below is
-    # never set and the last assertion says so at SHUTDOWN_WAIT instead of the
-    # test sitting through a 30 s sleep per pass. It is a second line only: the
-    # bounded waits are what make this test unable to hang at all.
+    # A clock that refuses to sleep, as a watchdog: a reporting loop that slept instead
+    # of waiting on the Event raises _StopLoop on the worker, and `returned` fails at
+    # SHUTDOWN_WAIT.
     monkeypatch.setattr(app, "time", _FakeClock(ticks=0))
 
     returned = _run_on_a_worker_thread()
@@ -488,10 +315,9 @@ def test_run_starts_dns_and_http_when_the_proxmox_client_cannot_be_built(monkeyp
 def test_run_starts_dns_and_http_when_the_first_domain_fetch_raises(monkeypatch):
     """The same invariant one step later: a client that builds, then a fetch that throws.
 
-    get_domains() degrades an unreachable API to None, but only for the two
-    exception types it catches. proxmoxer's AuthenticationError derives from plain
-    Exception and is neither of them, so it reaches run() — which is why
-    initial_domains() guards the call rather than trusting it.
+    get_domains() degrades only the two exception types it catches to None;
+    proxmoxer's AuthenticationError derives from plain Exception, so
+    initial_domains() must guard the call.
     """
     dns_started = threading.Event()
     http_started = threading.Event()
@@ -523,13 +349,9 @@ def test_run_installs_a_handler_for_the_signals_a_container_is_stopped_with(
         monkeypatch, saved_signal_handlers):
     """Without this, `docker stop` does nothing at all until the kernel kills it.
 
-    Being PID 1 is what makes the signal ARRIVE, not what makes it do anything:
-    the kernel gives PID 1 no default signal dispositions, so a SIGTERM that PID
-    1 has installed no handler for is DROPPED. A process in that state ignores
-    the whole grace period and is then SIGKILLed — and since /entrypoint.sh
-    `exec`s gosu, python here IS PID 1 and is in exactly that position unless
-    run() makes this call. Both signals: SIGTERM is what `docker stop` sends,
-    SIGINT is what a foreground `docker run` or a local `make run` sends.
+    PID 1 has no default signal dispositions, so an unhandled SIGTERM is dropped and
+    the process is SIGKILLed after the grace period. /entrypoint.sh `exec`s gosu, so
+    python is PID 1. SIGTERM is what `docker stop` sends; SIGINT a foreground run.
     """
     _isolate_module_state(monkeypatch)
     monkeypatch.setattr(app, "build_client", lambda _cfg: object())
@@ -537,11 +359,8 @@ def test_run_installs_a_handler_for_the_signals_a_container_is_stopped_with(
     monkeypatch.setattr(app, "start_dns_server", _parked_target())
     monkeypatch.setattr(app, "start_http_server", _parked_target())
     monkeypatch.setattr(app, "update_dns_periodically", _parked_target())
-    # Pre-set here, unlike the two tests above, and deliberately so: it makes run()
-    # leave by its early-return path, which is the shortest way to the one thing
-    # this test asks. The handlers go on BEFORE anything that can block, so they
-    # are installed on that path too — and if they ever stopped being first, this
-    # test is what says so.
+    # Pre-set so run() takes the early-return path; handlers are installed before
+    # anything that can block, so they are installed on that path too.
     app._shutdown.set()
     monkeypatch.setattr(app, "time", _FakeClock(ticks=0))  # watchdog, as above
 
@@ -560,26 +379,16 @@ def test_run_leaves_without_binding_anything_when_the_stop_arrived_during_startu
         monkeypatch, saved_signal_handlers):
     """A stop recorded during the initial fetch is acted on the moment that fetch returns.
 
-    Installing a handler makes the signal RECORDED, not acted on: under PEP 475
-    CPython resumes the interrupted syscall once the handler returns, so a SIGTERM
-    landing while initial_domains() waits on an unreachable PVE does nothing until
-    that call comes back. What happens next is what this pins. Without the check
-    run() would go on to bind :53 and :80, log a start, and tear the lot down on
-    its first wait() — and every one of those steps is time charged against the
-    stop_grace_period the stop is already spending. Under docker's 10 s default,
-    with proxmoxer's 5 s timeout on each per-VM guest-agent call, that margin is
-    what decides between exit 0 and a SIGKILL on exit 137.
-
-    The three targets are stand-ins that would report in if they were reached; the
-    point of the test is that none of them is.
+    Under PEP 475 a SIGTERM during an initial fetch is not acted on until the call
+    returns. run() must then return before binding :53 and :80, since every further
+    step spends the grace period. None of the three stand-in targets may be reached.
     """
     dns_started = threading.Event()
     http_started = threading.Event()
     updater_started = threading.Event()
 
     def slow_pve_that_is_stopped_mid_fetch(_proxmox, _host):
-        # Stands in for the blocking call: the signal arrives while it is out, and
-        # the handler has already returned by the time it does.
+        # Stands in for the blocking call: the signal arrives while it is out.
         app._shutdown.set()
         return []
 
@@ -609,43 +418,25 @@ def test_run_leaves_without_binding_anything_when_the_stop_arrived_during_startu
 def test_the_main_loop_returns_as_soon_as_the_handler_fires(monkeypatch):
     """The wait must be interruptible, not a 30 s nap the shutdown has to sit out.
 
-    run() goes on a WORKER thread, through _run_on_a_worker_thread() like the two
-    startup tests above — see that helper for why nothing here may call run() on
-    the main thread. Nothing joins that worker: it is a daemon, and what catches a
-    regression to a bare `time.sleep(30)` is `returned.wait(SHUTDOWN_WAIT)` below
-    expiring with a message, rather than a suite that hangs for half a minute and
-    then forever.
+    run() goes on a worker thread (see _run_on_a_worker_thread()), so a regression to a
+    bare `time.sleep(30)` fails at SHUTDOWN_WAIT instead of hanging.
 
-    THE STOP HAS TO ARRIVE AFTER STARTUP, and that is not a detail. run() returns
-    early — before it binds anything, before the loop exists — when the Event is
-    already set on entry. Thread.start() comes back long before the worker is
-    through install_signal_handlers() and initial_domains(), so asking for the
-    stop right after it reaches that early return every time: the loop this test
-    is named after is never entered, and a loop mutated back to time.sleep() sails
-    through. So the last thread run() starts reports in, and only then is the
-    shutdown requested — by which point run() is provably past the early return,
-    with nothing left ahead of it but the loop.
+    The stop must arrive after startup: run() returns early when the Event is already
+    set, which would skip the loop. So the last thread run() starts reports in first.
 
-    request_shutdown() is called directly, exactly as the kernel would call it,
-    instead of raising a real signal: a real SIGTERM in a process where the
-    handler had gone missing would kill the pytest run itself rather than report
-    a failure.
+    request_shutdown() is called directly rather than raising a real signal, which
+    would kill pytest if the handler were missing.
     """
     _isolate_module_state(monkeypatch)
-    # A shutdown Event that records the loop WAITING on it, so "run() came back"
-    # and "run() came back out of the loop" are two separate claims. Without it a
-    # run() that returned from the early return above would satisfy the assertion
-    # below just as well, which is precisely how this test used to pass while
-    # testing nothing. Installed after _isolate_module_state(), which puts a plain
-    # Event there.
+    # Records the loop waiting on it, so leaving via the early return cannot satisfy
+    # the assertions below.
     shutdown = _RecordingEvent()
     monkeypatch.setattr(app, "_shutdown", shutdown)
     monkeypatch.setattr(app, "build_client", lambda _cfg: object())
     monkeypatch.setattr(app, "get_domains", lambda _proxmox, _host: [])
     monkeypatch.setattr(app, "start_dns_server", _parked_target())
-    # The LAST of the three threads run() starts, and the one that reports startup
-    # is complete. `then_stop` stays off on purpose: this test wants the stop to
-    # come from OUTSIDE, at a moment it chooses, not from inside the thread.
+    # The last of the three threads run() starts. No `then_stop`: the stop comes from
+    # outside, after startup.
     http_started = threading.Event()
     monkeypatch.setattr(app, "start_http_server", _parked_target(http_started))
     monkeypatch.setattr(app, "update_dns_periodically", _parked_target())
@@ -716,8 +507,7 @@ def test_updater_retries_a_failed_client_and_fills_the_zone_once_pve_answers(mon
         f"expected two failed builds and one that took, got {len(attempts)} attempts: "
         "either the updater gave up after the first failure, or it rebuilds the client "
         "on every tick instead of caching it")
-    # Read back through the module: publish_domains() rebinds state.servers_list, so
-    # the list this test started with is not the one the zone is served from.
+    # publish_domains() rebinds state.servers_list, so read it through the module.
     assert state.servers_list == domains, (
         f"the zone was not refreshed once PVE answered: {state.servers_list!r}")
 
@@ -745,28 +535,22 @@ def test_the_startup_fetch_names_a_host_that_shows_no_guests(monkeypatch, caplog
 
 
 # --- Every configured host, not just the first one ------------------------------------
-# The group that has to exist because everything above it can be satisfied by ONE host.
-# _isolate_module_state() installs a single host by default, so a run() test says nothing
-# about the second one — and the three places that walk `_hosts` could each be cut down to
-# `_hosts[:1]` without a single test going red. These are written directly against that:
-# two hosts configured, and something that only a run over both of them can produce.
+# _isolate_module_state() installs one host by default, so these tests configure two and
+# assert what only a run over both produces; each walk of `_hosts` could otherwise be cut to
+# `_hosts[:1]` unnoticed.
 
 
 def test_run_starts_an_updater_for_every_configured_host(monkeypatch):
     """One thread per host is the entire point of the per-host design.
 
-    A shared loop over the hosts would stall every host behind one that black-holes
-    packets, at proxmoxer's 5 s timeout per guest-agent call — which is why each host
-    gets a thread of its own. A run() that started only the first host's updater looks
-    perfectly healthy: the zone still fills from that host, the servers still bind, and
-    every other test in this file still passes. What is gone is every other host's
-    refresh, forever.
+    A shared loop would stall every host behind one that black-holes packets. A run()
+    that started only the first host's updater looks healthy while every other host's
+    refresh is gone.
     """
     hosts = _isolate_module_state(monkeypatch, ["pve1.test", "pve2.test"])
     polled = set()
     all_polled = threading.Event()
-    # Never released, exactly like _parked_target(): a target that RETURNS sends
-    # start_thread() straight back round its `while True` and spins a core.
+    # Never released, like _parked_target(): a returning target would spin start_thread().
     parked = threading.Event()
 
     def updater(host):
@@ -796,14 +580,9 @@ def test_run_starts_an_updater_for_every_configured_host(monkeypatch):
 def test_initial_domains_fetches_every_host_even_when_the_first_one_fails(monkeypatch):
     """The startup fetch is N fetches, and the first one failing ends none of the others.
 
-    The failure is put on the FIRST host deliberately: a fetch that gave up on the
-    whole zone the moment one host raised, or one that only ever looked at `_hosts[0]`,
-    both produce an empty zone here while a merge over one host produces the same
-    answer as before.
-
-    Read back through state.servers_list, like every other test in this group:
-    initial_domains() returns nothing, and that list is the zone the DNS server answers
-    from. Asserting on a return value would leave the publish itself untested.
+    The failure is on the first host, so giving up on the whole zone or only looking at
+    `_hosts[0]` both produce an empty zone. Read through state.servers_list, since
+    initial_domains() returns nothing.
     """
     _isolate_module_state(monkeypatch, ["pve1.test", "pve2.test"])
     monkeypatch.setattr(app, "build_client", lambda _cfg: object())
@@ -826,17 +605,10 @@ def test_initial_domains_fetches_every_host_even_when_the_first_one_fails(monkey
 def test_the_initial_fetches_of_all_hosts_overlap_in_time(monkeypatch):
     """Concurrently, not one after another — on the one path where waiting is downtime.
 
-    initial_domains() runs before the DNS socket is bound, so its duration IS an
-    outage of the whole `.lc` zone. Sequentially, several dead hosts cost the SUM of
-    their timeouts; concurrently they cost the slowest one, and the deadline caps even
-    that.
-
-    The rendezvous is what makes the claim testable without measuring a clock: each
-    fetch only returns once EVERY host is inside the fetch at the same moment. A
-    sequential loop can never assemble that — the first call waits out RENDEZVOUS_WAIT
-    alone, breaks the barrier, and the rest raise on it immediately — so both hosts
-    lose their names and the assertion below reports it as missing names rather than
-    as a timing flake.
+    initial_domains() runs before the DNS socket is bound, so its duration is an outage.
+    Each fetch returns only once every host is inside the fetch at the same moment; a
+    sequential loop cannot assemble the barrier, so the hosts lose their names and the
+    test fails on missing names rather than on timing.
     """
     hosts = _isolate_module_state(monkeypatch, ["pve1.test", "pve2.test"])
     monkeypatch.setattr(app, "build_client", lambda _cfg: object())
@@ -861,27 +633,16 @@ def test_the_initial_fetches_of_all_hosts_overlap_in_time(monkeypatch):
 def test_the_initial_fetch_gives_up_its_wait_when_a_stop_arrives(monkeypatch):
     """A SIGTERM during startup must not be paid for at the startup's own pace.
 
-    The container is on its way down and the grace period is already running. Waiting
-    out INITIAL_FETCH_DEADLINE for a host that will never answer spends that budget on
-    a startup which is about to be thrown away — and what is at the end of the budget
-    is a SIGKILL on exit 137.
+    Waiting out INITIAL_FETCH_DEADLINE for a host that never answers spends the grace
+    period on a startup about to be discarded. pve2 never answers, so only the wait
+    noticing the flag ends the call early; measured in real time on purpose.
 
-    pve2 here never answers at all; only the wait noticing the flag can end this call
-    early. The bound is measured against real time on purpose: this is a claim about
-    wall clock, and a fake clock would let the very regression it guards pass.
-
-    initial_domains() RUNS ON A DAEMON THREAD, for the reason _run_on_a_worker_thread()
-    gives about run(). A regression to a sequential fetch — the obvious way to lose this
-    property — leaves the call blocked on pve2 for ever, and on the main thread that is
-    not a failing test but a suite that never finishes: nothing here would be left to
-    fail it, and pytest-timeout is not a dependency. On a worker thread the same
-    regression is the bounded wait below expiring with a message. The black hole is
-    bounded too, as a second line of defence: no correct run ever reaches the end of it.
+    initial_domains() runs on a daemon thread, so a sequential-fetch regression fails at
+    ABANDON_WAIT instead of hanging the suite. The black hole is bounded as well.
     """
     _isolate_module_state(monkeypatch, ["pve1.test", "pve2.test"])
     monkeypatch.setattr(app, "build_client", lambda _cfg: object())
-    # Never set by anything. The bound is what keeps a stuck fetch thread from
-    # outliving the test run itself; a daemon thread parked on it costs nothing.
+    # Never set; the bound keeps a stuck fetch thread from outliving the run.
     black_hole = threading.Event()
 
     def pve2_never_answers(_proxmox, host):
@@ -890,9 +651,8 @@ def test_the_initial_fetch_gives_up_its_wait_when_a_stop_arrives(monkeypatch):
         return [_entry("one.lc", "pve1.test", vmid=101)]
 
     monkeypatch.setattr(app, "get_domains", pve2_never_answers)
-    # The stop is already recorded when the fetch begins, which is the same state the
-    # process is in a moment after a SIGTERM lands mid-fetch: the handler has returned
-    # and the Event is set while the fetch is still out.
+    # The stop is recorded before the fetch begins: the same state as a SIGTERM that
+    # lands mid-fetch after its handler has returned.
     app._shutdown.set()
     zone_before_the_fetch = state.servers_list
 
@@ -904,9 +664,7 @@ def test_the_initial_fetch_gives_up_its_wait_when_a_stop_arrives(monkeypatch):
 
     threading.Thread(target=call_initial_domains, daemon=True).start()
 
-    # The wait IS the measurement: it comes back as soon as the fetch returns, and
-    # expires if the fetch is still going — so the clock is read the same way either
-    # way, without the test having to hold the call on its own thread to time it.
+    # The wait is the measurement: it returns when the fetch returns.
     assert returned.wait(ABANDON_WAIT), (
         f"the startup fetch was still going {ABANDON_WAIT} s after being started with "
         f"the shutdown flag already set. It is waiting out its own "
@@ -914,19 +672,15 @@ def test_the_initial_fetch_gives_up_its_wait_when_a_stop_arrives(monkeypatch):
         "that is being abandoned, and every second of it comes out of the container's "
         "stop_grace_period")
 
-    # Abandoning the WAIT is not abandoning the PUBLISH: whatever arrived before the flag
-    # was noticed is still assembled and written to the zone, so a stop that turns out not
-    # to be one — the signal handler is installed before the fetch, and run() decides what
-    # to do about it afterwards — leaves the DNS server with the names that did answer.
-    # The rebind is the whole claim; WHICH host's names got in is a race with the shutdown
-    # by construction and is not something to assert on.
+    # Abandoning the wait is not abandoning the publish: whatever arrived is still
+    # written to the zone. Which host's names got in races the shutdown, so only the
+    # rebind is asserted.
     assert state.servers_list is not zone_before_the_fetch, (
         "the startup fetch gave up its wait and published nothing at all: "
         "state.servers_list still holds the object it held before the fetch ran. The "
         "write inside initial_domains() is the only path the pre-fill has into the zone")
 
-    # The claim is made; now let the parked fetch finish INSIDE this test rather than
-    # leaving it to wake up in the middle of another one. See _join_the_startup_fetch_of.
+    # Let the parked fetch finish inside this test (see _join_the_startup_fetch_of).
     black_hole.set()
     _join_the_startup_fetch_of("pve2.test")
 
@@ -934,17 +688,12 @@ def test_the_initial_fetch_gives_up_its_wait_when_a_stop_arrives(monkeypatch):
 def _join_the_startup_fetch_of(host_name):
     """Wait, BOUNDED, for one host's startup-fetch thread to finish.
 
-    initial_domains() names those threads after the host they fetch, which is what makes
-    them findable from here — and joining one is the difference between asserting on
-    what a late fetch did and polling until it probably has. A thread that has already
-    finished is not in the enumeration any more; that is a pass, not a miss.
+    initial_domains() names those threads after their host. A thread that already
+    finished is not enumerated, which is a pass.
 
-    EVERY TEST THAT PARKS A FETCH THREAD MUST RELEASE IT AND JOIN IT HERE before it
-    ends, and not only out of tidiness. A parked fetch is a straggler by construction,
-    so when it finally wakes it takes the late-publish path — and by then monkeypatch
-    has put the real `_hosts` and the real `state.servers_list` back, so the write lands
-    in the module state of whatever test is running at that moment. It would also be
-    found by this helper under the name the next test is looking for.
+    Every test that parks a fetch thread must release and join it here: on waking it
+    takes the late-publish path, and after monkeypatch has restored the real `_hosts`
+    and `state.servers_list` it would write into another test's state.
     """
     for thread in threading.enumerate():
         if thread.name == f"initial-fetch({host_name})":
@@ -958,22 +707,13 @@ def _join_the_startup_fetch_of(host_name):
 def test_a_host_that_answers_after_the_deadline_still_publishes_its_names(monkeypatch):
     """A late answer goes into the zone; it is not thrown away for being late.
 
-    The deadline exists to stop a slow host from holding the DNS socket, and it does
-    that by binding without it. Discarding the answer when it does arrive is a separate
-    decision and a bad one: a host with forty or fifty guests can genuinely miss the
-    deadline, and its names would then wait for a whole second full walk by its own
-    updater — roughly doubling time-to-zone for exactly the hosts the pre-fill exists
-    for.
-
-    pve2 is held past a deliberately tiny deadline and released afterwards, so the
-    publish under test is unambiguously the LATE path: initial_domains() has already
-    returned a zone without it.
+    A host with many guests can miss the deadline; discarding its answer would make its
+    names wait for a full updater walk. pve2 is held past a tiny deadline and released
+    after initial_domains() returned, so the publish under test is the late path.
     """
     _isolate_module_state(monkeypatch, ["pve1.test", "pve2.test"])
     monkeypatch.setattr(app, "build_client", lambda _cfg: object())
-    # Short enough that the test can outlast it without waiting on anything real. The
-    # value is not what is under test — that a missed deadline is survivable is — so
-    # shrinking it costs nothing and keeps the suite off a ten-second wait.
+    # Short so the test outlasts it quickly; the value itself is not under test.
     monkeypatch.setattr(app, "INITIAL_FETCH_DEADLINE", 0.2)
     answer = threading.Event()
     addresses = {"pve1.test": "10.0.0.5", "pve2.test": "10.0.0.6"}
@@ -1004,11 +744,8 @@ def test_a_host_that_answers_after_the_deadline_still_publishes_its_names(monkey
 def test_a_late_startup_fetch_never_lands_on_top_of_the_updaters_own_slice(monkeypatch):
     """The other half of it: late is allowed, stale is not.
 
-    By the time a late fetch answers, that host's updater thread is running and may
-    already have published something newer. The late answer was built before the sockets
-    were bound, so letting it through then would put a stale address into the zone and
-    leave it there until the next refresh — the exact failure the discard used to
-    prevent, which is why the late path is conditional rather than unconditional.
+    The late answer was built before the sockets were bound; if the host's updater has
+    already published something newer, the late answer must not overwrite it.
     """
     hosts = _isolate_module_state(monkeypatch, ["pve1.test", "pve2.test"])
     monkeypatch.setattr(app, "build_client", lambda _cfg: object())
@@ -1024,8 +761,7 @@ def test_a_late_startup_fetch_never_lands_on_top_of_the_updaters_own_slice(monke
     monkeypatch.setattr(app, "get_domains", pve2_answers_after_the_deadline)
 
     app.initial_domains()
-    # pve2's own updater gets there first — which is precisely the case the deadline
-    # hands the slice over for.
+    # pve2's own updater gets there first.
     app.publish_domains(hosts[1], [_entry("two.lc", "pve2.test", vmid=202, ipv4="10.0.0.99")])
 
     answer.set()
@@ -1041,19 +777,10 @@ def test_a_late_startup_fetch_never_lands_on_top_of_the_updaters_own_slice(monke
 def test_the_startup_prefill_publishes_the_zone_even_when_no_host_answers(monkeypatch):
     """The pre-fill's own write, which nothing else in this file can see.
 
-    initial_domains() returns nothing and run() assigns nothing, so the one line inside
-    it that rebinds state.servers_list is the ONLY path by which the pre-fill reaches the
-    list the DNS server answers from. Deleting that line leaves every per-host slice
-    correct, every merge correct, and the zone empty — a regression that no assertion on
-    a returned list can see, and one whose cost is written on the function itself: the
-    DNS server binds and answers NXDOMAIN for real names until the first poll lands,
-    while whoever asked caches the negative answer.
-
-    Every host fails here, so what gets published is an EMPTY zone, and the claim is the
-    publish rather than its contents: merge_domains() always builds a new list, so the
-    rebind is what tells an assignment that happened from one that never did. Empty is
-    also the case where the write is easiest to think unnecessary, which is exactly why
-    it is the one pinned.
+    initial_domains() returns nothing and run() assigns nothing, so the rebind inside it
+    is the only path by which the pre-fill reaches the DNS server. Every host fails, so
+    the published zone is empty; merge_domains() always builds a new list, so the rebind
+    itself is what is asserted.
     """
     _isolate_module_state(monkeypatch, ["pve1.test", "pve2.test"])
     monkeypatch.setattr(app, "build_client", lambda _cfg: object())
@@ -1078,28 +805,20 @@ def test_an_answer_already_in_its_slot_is_harvested_before_its_fetch_finishes(
         monkeypatch, caplog):
     """The harvest reads the SLOTS, and `done` is set later — from outside the lock.
 
-    A fetch thread writes its slot INSIDE _publish_lock and sets its done Event in a
-    `finally`, AFTER the lock is released. In between, the slot is filled and the answer
-    is on time — the fetch computed `on_time = True`, so it will publish nothing itself —
-    while `done` still says the host has not answered. A harvest that ALSO required
-    `done` skipped that slot, and the host's answer was then published by neither side:
-    its names were NXDOMAIN until its own updater's first successful poll, with every
-    asker caching that in the meantime. It is the one failure of this machinery that
-    costs a host its whole slice.
+    A fetch writes its slot inside _publish_lock and sets `done` in a `finally` after the
+    lock is released. In between, the answer is on time (the fetch will not publish it
+    itself) while `done` is unset; a harvest that also required `done` would skip it,
+    and the host's names would be NXDOMAIN until its updater's first successful poll.
 
-    The window is opened deliberately rather than waited for. The substituted lock holds
-    the fetch thread on its way out of the release that carries the slot write — slot
-    written, lock free, `done` unset — and the substituted clock expires the deadline at
-    that exact moment, so the harvest runs inside the window on every run of this test
-    rather than on the unlucky ones. Neither stand-in changes what src/app.py does; they
-    only decide when the two threads meet.
+    The substituted lock holds the fetch thread in that window and the substituted clock
+    expires the deadline at that moment, so the harvest always runs inside it. Neither
+    changes what src/app.py does.
     """
     _isolate_module_state(monkeypatch, ["pve1.test"])
     parked = threading.Event()
     proceed = threading.Event()
-    # Set as the fetch's answer comes back, which is what lets the lock double tell the
-    # release that carries the slot write from any release taken on the way TO an answer.
-    # See _LockThatParksAFetchOnItsWayOut.
+    # Set as the answer comes back, so the lock double can tell the release that carries
+    # the slot write (see _LockThatParksAFetchOnItsWayOut).
     answered = threading.Event()
     monkeypatch.setattr(app, "build_client", lambda _cfg: object())
 
@@ -1116,8 +835,8 @@ def test_an_answer_already_in_its_slot_is_harvested_before_its_fetch_finishes(
     with caplog.at_level("WARNING"):
         app.initial_domains()
 
-    # Released and joined before anything is asserted, so a failure below does not leave
-    # a fetch thread parked into whatever test runs next. See _join_the_startup_fetch_of.
+    # Released and joined before asserting, so a failure does not leave a parked thread
+    # (see _join_the_startup_fetch_of).
     proceed.set()
     _join_the_startup_fetch_of("pve1.test")
 
@@ -1140,24 +859,13 @@ def test_a_host_that_did_not_answer_by_the_deadline_is_named_in_the_warning(
         monkeypatch, caplog):
     """The positive half of that warning, without which the negative halves prove nothing.
 
-    Two tests around this one assert that a host is NOT named in this message, and a
-    negative assertion on a log line is worth exactly as much as the line's own existence.
-    Nothing else pinned it: disable the warning block, or drop the `late.append(...)` that
-    fills its list, and both of those tests stay green — the machinery they are about can
-    be switched off in full and the suite does not notice. Rewording the message does the
-    same thing more quietly still, since both of them match on its wording: they would go
-    on passing, and the `pending` sentinel the one below exists to protect would be
-    covered by nothing at all.
-
-    So the message is pinned from the side that names a host. pve2 is held past a
-    deliberately tiny deadline and pve1 answers at once, which is also the case the
-    warning is written for: the zone is already being served, and this line is the only
-    place that says whose names are missing from it and why.
+    Two other tests assert a host is NOT named in this message; without this one,
+    removing or rewording the warning would leave them green. pve2 is held past a tiny
+    deadline while pve1 answers at once.
     """
     _isolate_module_state(monkeypatch, ["pve1.test", "pve2.test"])
     monkeypatch.setattr(app, "build_client", lambda _cfg: object())
-    # Shrunk for the same reason as in the late-publish test above: the value is not what
-    # is under test, and a real 10 s deadline would only make the suite wait for it.
+    # Shrunk as in the late-publish test; the value is not under test.
     monkeypatch.setattr(app, "INITIAL_FETCH_DEADLINE", 0.2)
     answer = threading.Event()
     addresses = {"pve1.test": "10.0.0.5", "pve2.test": "10.0.0.6"}
@@ -1171,15 +879,11 @@ def test_a_host_that_did_not_answer_by_the_deadline_is_named_in_the_warning(
 
     with caplog.at_level("WARNING"):
         app.initial_domains()
-    # The zone and the log are read off HERE, while pve2 is still blocked, and asserted
-    # after the release below: the late publish that follows changes both, and nothing
-    # here is a claim about what they look like once pve2 has finally answered.
+    # Read while pve2 is still blocked: the late publish after the release changes both.
     zone = _domains_by_host(state.servers_list)
     warning = caplog.text
 
-    # Released and joined before anything is asserted, exactly as the tests above do: a
-    # fetch left parked here wakes up inside whatever test runs next. See
-    # _join_the_startup_fetch_of.
+    # Released and joined before asserting (see _join_the_startup_fetch_of).
     answer.set()
     _join_the_startup_fetch_of("pve2.test")
 
@@ -1201,20 +905,12 @@ def test_a_host_whose_fetch_failed_in_time_is_not_named_in_the_deadline_warning(
         monkeypatch, caplog):
     """A FAILURE IS NOT A MISSED DEADLINE, and the slots are the only thing telling them apart.
 
-    A slot starts as a `pending` sentinel rather than as None, because None is what a
-    fetch that RAN AND FAILED stores in it. Collapse the two — `slots = [None] * len(_hosts)`
-    with a harvest keyed on `domains is None` — and everything about the zone stays correct
-    while a host that answered in 200 ms is ALSO reported as having gone quiet for
-    INITIAL_FETCH_DEADLINE seconds. That is the whole damage, and none of it shows in the
-    zone: measured, the mutation takes this test down and nothing else in the suite.
+    A slot starts as a `pending` sentinel rather than None, because None is what a fetch
+    that ran and failed stores. Collapsing the two keeps the zone correct but reports a
+    host that failed in 200 ms as silent for INITIAL_FETCH_DEADLINE, contradicting its
+    own ERROR and pointing the reader at the network instead of the credential.
 
-    The cost is paid by whoever reads the log. A revoked token fails fast and says so in an
-    ERROR of its own. Stacking "no answer within 10 s" on top of that line contradicts it,
-    and the false half is the one that points at the network and at timeouts rather than at
-    the credential the true half names.
-
-    pve1 fails at once and well inside the deadline; pve2 answers normally. Nothing here is
-    late, so the warning must not be produced at all.
+    pve1 fails at once; pve2 answers normally. Nothing is late, so no warning.
     """
     _isolate_module_state(monkeypatch, ["pve1.test", "pve2.test"])
     monkeypatch.setattr(app, "build_client", lambda _cfg: object())
@@ -1248,11 +944,9 @@ def test_a_host_whose_fetch_failed_in_time_is_not_named_in_the_deadline_warning(
 def test_a_state_is_built_for_every_entry_of_proxmox_hosts():
     """`_hosts` is the list all three of the tests above walk. It is built once, at import.
 
-    Nothing else in this file can see this: every other test replaces `_hosts` with
-    states of its own making, so a `_hosts` built from `settings.proxmox_hosts[:1]`
-    would leave the whole suite green and the deployment polling one of its hosts.
-    tests/conftest.py configures two on purpose, which is what makes the comparison
-    below worth making.
+    Every other test replaces `_hosts`, so a `_hosts` built from
+    `settings.proxmox_hosts[:1]` would pass them all. tests/conftest.py configures two
+    hosts so the comparison means something.
     """
     configured = [cfg.host for cfg in settings.proxmox_hosts]
 
@@ -1422,14 +1116,12 @@ def test_a_collision_is_logged_with_both_hosts_and_both_vmids(caplog):
 
 
 def test_two_guests_with_one_name_on_ONE_host_both_stay_in_the_zone():
-    """The regression guard. A duplicate within one host is not a cross-host collision.
+    """A duplicate within one host is not a cross-host collision.
 
-    The domain is the VM name's first segment, so `web-01` and `web-02` ON THE SAME
-    HOST both produce `web.lc`. That predates the multi-host work entirely and both
-    entries have always been in the list. A merge that dedupes by domain alone collapses
-    them, and what goes with the dropped entry is its ADDRESS: src/dns_server.py answers
-    a PTR by scanning the list for the address, so that guest's reverse lookup starts
-    answering NXDOMAIN, and the status page loses its row too.
+    The domain is the VM name's first segment, so `web-01` and `web-02` on the same host
+    both produce `web.lc`. Deduping by domain alone would drop an entry and its address:
+    src/dns_server.py answers a PTR by scanning the list for the address, so that guest's
+    reverse lookup would answer NXDOMAIN, and the status page would lose its row.
     """
     merged = app.merge_domains([[
         _entry("web.lc", "pve1.test", vmid=101, ipv4="10.0.0.5"),
@@ -1443,12 +1135,10 @@ def test_two_guests_with_one_name_on_ONE_host_both_stay_in_the_zone():
 
 
 def test_a_duplicate_within_one_host_is_logged_at_debug_rather_than_warning(caplog):
-    """Once a minute, forever, about something no operator was asked to change.
+    """A within-host duplicate is DEBUG, not WARNING.
 
-    The merge runs on every rebuild, so a WARNING here is a line per host per refresh
-    for as long as both guests exist — and the text of it named the same host on both
-    sides of a "collision between hosts". The fact is still recorded, at a level whose
-    job is exactly this.
+    The merge runs on every rebuild, so a WARNING would be a line per host per refresh
+    for as long as both guests exist.
     """
     entries = [
         _entry("web.lc", "pve1.test", vmid=101, ipv4="10.0.0.5"),
@@ -1527,17 +1217,12 @@ def _first_answer_for(merged, domain):
 def test_the_entries_of_one_name_are_emitted_best_first():
     """Which HOST wins is only half of it: the DNS server answers with the first match.
 
-    Ranking hosts puts the right host's entries in the zone and stops there. Within them
-    the order was whatever Proxmox listed, so a stopped `web-01` sitting ahead of a
-    running `web-02` handed every client the 0.0.0.0 sentinel — a healthy, reachable
-    guest dropped in favour of one that is switched off, with both records present and
-    nothing in the log.
+    Ranking hosts decides which host's entries are in the zone; within them a stopped
+    `web-01` listed ahead of a running `web-02` would hand every client the 0.0.0.0
+    sentinel, with both records present and nothing in the log.
 
-    Asserted on BOTH branches of the merge. The single-host one is not a multi-host bug
-    at all: one host with those two guests has always answered that way, and the sort
-    fixes it here for the first time. The collision branch is the case the reviewer
-    reproduced — pve1 wins the name on the strength of its running guest and then serves
-    its stopped one.
+    Asserted on both branches of the merge: a single host with those two guests, and a
+    collision where pve1 wins on its running guest.
 
     test_a_host_is_ranked_by_its_BEST_entry_rather_than_by_its_first cannot catch this:
     both of the entries competing there carry 0.0.0.0, so any order of them looks alike.

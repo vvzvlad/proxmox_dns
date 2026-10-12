@@ -26,7 +26,7 @@ class _Entry(BaseModel):
 
 
 class _Nested(BaseSettings):
-    """The shape src/settings.py now has: one env var holding a list of models."""
+    """The shape of src/settings.py: one env var holding a list of models."""
 
     entries: list[_Entry]
     model_config = SettingsConfigDict(env_file=None, extra="ignore")
@@ -55,10 +55,8 @@ def test_invalid_value_exits_with_clear_message(capsys, monkeypatch):
 def test_error_inside_a_list_entry_names_the_index_and_the_field(capsys, monkeypatch):
     """An operator with four PVE hosts configured must be told WHICH one is wrong.
 
-    pydantic reports this as loc ("entries", 1, "secret"). Printing loc[0] alone —
-    which is what this module used to do — says only that ENTRIES is bad, and the
-    variable it names is a JSON list that may hold half a dozen hosts. The whole
-    path is the difference between one fix and a search.
+    pydantic reports this as loc ("entries", 1, "secret"); the message must render the
+    whole path, not just the variable holding the JSON list.
     """
     monkeypatch.setenv("ENTRIES", json.dumps([{"name": "a", "secret": "s"}, {"name": "b"}]))
     with pytest.raises(SystemExit) as ei:
@@ -70,14 +68,11 @@ def test_error_inside_a_list_entry_names_the_index_and_the_field(capsys, monkeyp
 
 
 def test_json_that_does_not_parse_names_the_variable_instead_of_raising(capsys, monkeypatch):
-    """The failure mode the JSON config format introduced, against the REAL settings.
+    """Unparseable JSON, against the REAL settings.
 
-    pydantic-settings cannot turn this value into anything, so it raises SettingsError
-    from the source — BEFORE validation, and NOT a ValidationError; the two share only
-    ValueError. A guard that catches only ValidationError therefore lets it past, and
-    what the operator gets is the raw traceback this module exists to prevent. Three
-    plain string variables could not fail this way; one variable holding a JSON list
-    can, and a mistyped or wrapped value is how.
+    pydantic-settings raises SettingsError from the source before validation, not a
+    ValidationError (they share only ValueError), so a guard catching only
+    ValidationError would let the raw traceback through.
     """
     monkeypatch.setenv("PROXMOX_HOSTS", "not-json")
 
@@ -115,16 +110,12 @@ def test_a_settings_error_that_is_not_about_json_says_what_actually_went_wrong(c
     """SettingsError is TWO failures wearing one class, and only one of them is JSON.
 
     pydantic-settings raises it both for a value its JSON decoder rejected ("error
-    parsing value for field ...") and for a value the source could not read at all
-    ("error getting value for field ...", from a different `raise` with a different
-    cause). A message hardcoded to "the value is not valid JSON" sends an operator
-    holding the second one off to fix JSON that parses perfectly — and for a
-    SettingsError whose text carries no `field "..."` the whole line degrades to
-    `- ?: the value is not valid JSON`, which names nothing and explains nothing.
+    parsing value for field ...") and for a value the source could not read ("error
+    getting value for field ...", with a different cause). The second must not be
+    reported as invalid JSON.
 
-    Raised directly rather than provoked through pydantic-settings: this branch is
-    about what the module does with an exception it is handed, and reproducing the
-    library's internal read failure would pin this test to its internals instead.
+    Raised directly rather than provoked through pydantic-settings, so the test does
+    not depend on the library's internal read failure.
     """
     cause = OSError("secrets_dir is not readable")
 

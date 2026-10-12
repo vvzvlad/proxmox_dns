@@ -2,66 +2,44 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Unbuffered stdout/stderr. Without it Python block-buffers when its output is a pipe — which is
-# exactly what it is under docker — so the startup lines and the configuration error would sit in a
-# 8 KB buffer instead of reaching `docker logs`. That matters twice over here: those lines are what
-# the CI smoke gate waits for, and on a box they are the only thing that says why a container that
-# exited immediately did so.
+# Unbuffered stdout/stderr: under docker the output is a pipe, so Python would block-buffer the
+# startup lines and the configuration error that the CI smoke gate waits for in `docker logs`.
 ENV PYTHONUNBUFFERED=1
 
 # curl is required by the compose healthcheck (not present in slim).
-# gosu is what /entrypoint.sh drops privileges with. `su` and `sudo` are not interchangeable with it
-# here: both fork and wait, which leaves PID 1 a shell that does not forward SIGTERM — so `docker
-# stop` would sit out its full 10 s timeout and then SIGKILL the DNS server, on every single
-# redeploy of the service the whole `.lc` zone resolves through. gosu execs, so the python process
-# itself is PID 1 and the signal is DELIVERED to it.
-#
-# Delivery is only half of a working `docker stop`, and the half that is usually missed is the
-# other one: PID 1 gets NO default signal dispositions from the kernel, so a SIGTERM that PID 1 has
-# installed no handler for is DROPPED. Being PID 1 is therefore not enough on its own — it is what
-# makes the signal arrive, not what makes it do anything. src/app.py installs the handler
-# (install_signal_handlers()), and its main loop waits on an Event rather than sleeping, so the two
-# together are what make the container exit 0 in well under a second. ci/smoke.py check (k) sends a
-# real `docker stop` and fails the build if either half is lost.
+# gosu drops privileges in /entrypoint.sh by exec, so python itself is PID 1 and receives SIGTERM;
+# `su`/`sudo` fork and wait, leaving a shell as PID 1 that does not forward it. PID 1 also gets no
+# default signal dispositions, so src/app.py installs its own handler (install_signal_handlers()).
+# ci/smoke.py check (k) sends a real `docker stop` and fails the build if either half is lost.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends curl gosu \
     && rm -rf /var/lib/apt/lists/*
 
-# The account the service actually runs as. uid 1000 is spelled out rather than left to useradd's
-# next-free pick because two other places are pinned to that number: the chown below, and the
-# assertion in ci/smoke.py that PID 1 is 1000 and not root. A fixed uid also keeps ownership stable
-# across image rebuilds, which is what makes the number worth anything the day a volume appears.
+# The account the service runs as. uid 1000 is fixed because ci/smoke.py asserts PID 1 runs as 1000.
 RUN useradd -m -u 1000 app
 
 # Dependencies as a separate layer: change less often than code -> cached better
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Runtime state directory (proxmox_dns is stateless, but keep the convention). Owned by app so that
-# a named volume first initialised from this image inherits that ownership — docker copies it only
-# into an EMPTY volume, which is why /entrypoint.sh chowns again at run time.
+# Runtime state directory (proxmox_dns is stateless, but keep the convention). Docker copies this
+# ownership only into an empty volume, which is why /entrypoint.sh chowns again at run time.
 RUN mkdir -p data && chown app:app data
 
 # Code and static assets
 COPY src/ src/
 COPY templates/ templates/
 COPY main.py .
-# --chmod is not decoration: ENTRYPOINT in exec form does not go through a shell, so a script that
-# arrives without its executable bit does not fail the build — it fails every container at start
-# with `permission denied`. The bit does not survive every build context (a checkout on a filesystem
-# with no POSIX permissions drops it), so it is set here rather than hoped for.
+# --chmod: the executable bit does not survive every build context, and an exec-form ENTRYPOINT
+# without it fails every container at start with `permission denied`.
 COPY --chmod=0755 entrypoint.sh /entrypoint.sh
 
 # No EXPOSE: ports are published by docker-compose.
 
-# There is deliberately NO `USER` line. root is what /entrypoint.sh needs to chown the state
-# directory, and it drops to uid 1000 itself with gosu; a static USER here would take that root away
-# before the entrypoint could use it. Note that binding 53/udp and 80/tcp needs no privilege at all:
-# docker sets net.ipv4.ip_unprivileged_port_start=0 inside the container, so there are no privileged
-# ports in here — see the note in docker-compose.yml.
+# No `USER` line: /entrypoint.sh needs root to chown the state directory and drops to uid 1000 with
+# gosu. Binding 53/udp and 80/tcp needs no privilege: docker sets
+# net.ipv4.ip_unprivileged_port_start=0 inside the container.
 #
-# `docker exec` does NOT go through ENTRYPOINT, which is why ci/smoke.py's in-container probes still
-# arrive as root — and why the one thing they must never ask is their OWN uid. They read PID 1's
-# instead, which is the only process here that came through this line.
+# `docker exec` bypasses ENTRYPOINT and runs as root, so ci/smoke.py checks PID 1's uid, not its own.
 ENTRYPOINT ["/entrypoint.sh"]
 CMD ["python", "main.py"]
