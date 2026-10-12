@@ -76,9 +76,8 @@ def get_vm_inventory(proxmox, host):
     us whether the VM set / their names / run state changed, without the expensive
     per-VM guest-agent calls that get_domains performs.
 
-    `host` is only for the log line, but it is not decoration: every host polls on
-    its own thread, so an unattributed failure here says one of them is down
-    without saying which.
+    `host` is only for the log line: every host polls on its own thread, and the
+    failure has to say which one is down.
     """
     try:
         resources = proxmox.cluster.resources.get(type="vm")

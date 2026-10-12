@@ -7,20 +7,10 @@ from src import state
 from src.logging_setup import logger
 from src.settings import settings
 
-# The fields these pages publish, and the only ones. Both endpoints are
-# UNAUTHENTICATED — docker-compose.yml maps the HTTP port to :8076 and routes it
-# through Traefik as well — while an entry in state.servers_list carries whatever
-# src/proxmox.py and the merge put on it. Serialising that dict wholesale means every
-# field ever added to an entry lands on a public page the moment it appears; naming
-# them here means it has to be put there on purpose.
-#
-# `host` IS published, deliberately: with several PVE hosts merged into one zone it is
-# how a name served by two of them becomes visible to whoever is reading the page.
-# `vmid` is not — it identifies a guest inside somebody's Proxmox and says nothing to
-# a reader of a status page.
-#
-# The tuple is also the column ORDER of the HTML table below, so the two endpoints
-# cannot drift apart: a field added here shows up on both or on neither.
+# The only fields the pages publish. Both endpoints are unauthenticated, so entries are
+# projected onto this allowlist rather than serialised wholesale. `host` shows which PVE
+# host serves a name; `vmid` is not published. The tuple is also the column order of the
+# HTML table, so `/` and `/json` show the same fields.
 PUBLISHED_FIELDS = ("domain", "host", "ipv4", "ipv6", "status")
 
 # Column heading and empty-cell placeholder per published field.
@@ -68,20 +58,13 @@ class StatusRequestHandler(BaseHTTPRequestHandler):
         self.send_response(status_code)
         self.send_header("Content-type", "text/html")
         self.end_headers()
-        # Built from the same PUBLISHED_FIELDS projection /json uses, in the same order:
-        # the two views of the zone are then one decision rather than two lists that
-        # have to be remembered separately. Host is among them because several PVE hosts
-        # are merged into one zone, and this page is where a name served by two of them
-        # is actually visible.
-        # .get() and not [] on purpose: a field added to PUBLISHED_FIELDS without a
-        # heading here shows up as its own field name, which is ugly. A KeyError would
-        # make this page 500 instead — and `/` is what the compose healthcheck polls, so
-        # the container would go unhealthy and the updater would roll the image back.
+        # Same PUBLISHED_FIELDS projection and order as /json.
+        # .get(): a field without a heading shows its own name instead of a KeyError;
+        # `/` is what the compose healthcheck polls, so a 500 here rolls the image back.
         table_header = "<tr>" + "".join(
             f"<th>{html.escape(FIELD_TITLES.get(field, field))}</th>"
             for field in PUBLISHED_FIELDS) + "</tr>"
-        # Escaped, because every value here started life as a VM name on the PVE side —
-        # this page has no business rendering whatever somebody called a guest as markup.
+        # Escaped: values come from VM names on the PVE side.
         table_rows = "".join(
             "<tr>" + "".join(
                 "<td>{}</td>".format(html.escape(str(

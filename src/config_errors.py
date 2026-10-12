@@ -4,17 +4,11 @@ Reused by every entrypoint that builds settings so a missing or invalid
 environment variable fails fast with a readable message (naming the env var)
 instead of a raw pydantic traceback.
 
-TWO exception types, not one, and they are unrelated classes that happen to share
-ValueError. A value that violates the model is a ValidationError. A value that
-pydantic-settings cannot even turn INTO a value is a SettingsError, raised by the
-source before validation ever runs. Three plain string variables could not fail
-that way; one variable holding a JSON list can, and does, the moment an operator
-wraps it across two lines or clears it and leaves `PROXMOX_HOSTS=` behind.
-
-SettingsError is itself two cases sharing one class, and they are told apart by
-`__cause__` rather than by the class: a value the JSON decoder rejected (the
-common one here) and a value the source could not even read. Both are reported,
-each in its own words.
+Two unrelated exception types: a value that violates the model is a
+ValidationError; a value pydantic-settings cannot parse at all (e.g. PROXMOX_HOSTS
+JSON wrapped across two lines, or left empty) is a SettingsError raised by the
+source before validation. SettingsError covers a JSON decode failure and a read
+failure, told apart by `__cause__`.
 """
 
 import json
@@ -29,24 +23,17 @@ T = TypeVar("T")
 
 # pydantic-settings reports an unparseable complex field as
 # SettingsError('error parsing value for field "proxmox_hosts" from source "..."').
-# The field name is the only actionable part of it and the exception carries no
-# attribute for it, so it is read back out of the message. A miss is not fatal —
-# the message below falls back to naming no variable rather than to a traceback.
+# The exception carries no attribute for the field name, so it is read from the
+# message; on a miss the report names `?` instead.
 _SETTINGS_ERROR_FIELD = re.compile(r'field "([^"]+)"')
 
 
 def _render_location(loc) -> str:
     """Render a pydantic error location as the env var plus the path inside it.
 
-    loc[0] is the field name and the env var is its upper-case form, but for a
-    complex field the error is usually somewhere INSIDE the parsed value:
-    ("proxmox_hosts", 1, "token_value") is a bad token on the second host.
-    Printing loc[0] alone would tell an operator with four PVE hosts configured
-    that the whole variable is wrong and leave them to find out which entry.
-
-    Integer segments become `[i]` and string ones `.name`, so that example reads
-    PROXMOX_HOSTS[1].token_value. A single-segment loc renders exactly as it
-    always did.
+    loc[0] is the field name (the env var is its upper-case form); further segments
+    point inside the parsed value. Integers become `[i]` and strings `.name`, so
+    ("proxmox_hosts", 1, "token_value") reads PROXMOX_HOSTS[1].token_value.
     """
     if not loc:
         return "?"
@@ -66,25 +53,17 @@ def load_settings_or_exit(factory: Callable[[], T]) -> T:
     try:
         return factory()
     except SettingsError as exc:
-        # The value never reached the model: pydantic-settings raised from the source
-        # instead of validating. Rendered in the same shape as the block below, because
-        # from the operator's side it is the same event — a variable in .env is wrong
-        # and the message has to say which one and why.
+        # The value never reached the model. Rendered in the same shape as the
+        # ValidationError block below.
         match = _SETTINGS_ERROR_FIELD.search(str(exc))
         name = match.group(1).upper() if match else "?"
         cause = exc.__cause__
-        # WHICH KIND of SettingsError this is has to come off the CAUSE, not off the
-        # exception type. pydantic-settings raises the same class from two places: it
-        # wraps a failed decode ("error parsing value for field ...", caused by a
-        # JSONDecodeError) and a failed read ("error getting value for field ...",
-        # caused by whatever the source threw). Calling both "not valid JSON" tells an
-        # operator with the second one to go and fix JSON that is perfectly fine — and
-        # for a SettingsError whose message carries no `field "..."` at all it produced
-        # `- ?: the value is not valid JSON`, which says nothing whatsoever.
+        # The kind comes from the cause: pydantic-settings raises the same class for a
+        # failed decode (caused by JSONDecodeError) and a failed read (caused by
+        # whatever the source threw).
         if isinstance(cause, json.JSONDecodeError):
-            # The decoder carries the column it gave up at — the difference between
-            # "your JSON is wrong" and "your JSON stops after 200 characters", which is
-            # what a value wrapped onto a second line looks like from here.
+            # The decoder's message includes the column, which shows a value cut at a
+            # line break.
             problem = f"the value is not valid JSON ({cause})"
             advice = [
                 "It has to be ONE line of JSON: .env has no line continuation, so a value "

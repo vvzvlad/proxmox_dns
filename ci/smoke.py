@@ -1,143 +1,75 @@
 """Smoke gate for the proxmox_dns image, run on the CI runner against an already-built image.
 
-It sits BETWEEN `docker build` and `docker push`, which is the only place it is worth anything:
-nobody presses a button between the push and the rollout — the deployed stack carries
-`io.portainer.update.enable`, so an updater polls `:latest` and redeploys whatever lands on it. This
-gate is the last point at which a broken image can still be stopped.
-
-What it is guarding is unusually load-bearing for a service this small: proxmox_dns answers DNS for
-the whole internal `.lc` zone. An image that starts but does not serve does not degrade the network,
-it removes name resolution from it.
+It sits between `docker build` and `docker push`: the deployed stack carries
+`io.portainer.update.enable`, so whatever lands on `:latest` is redeployed with nobody in between.
+The image answers DNS for the whole internal `.lc` zone.
 
 THE SPLIT
 ---------
-The OUTER half is this file: a plain `python3 ci/smoke.py` on the runner, driving `docker`. It
-answers the questions that are about the container as an OBJECT — what `docker inspect` says its CMD
-and WORKDIR are, what the real command writes to its log, whether a run with no configuration
-refuses to start, whether the container is still alive when everything else is done. None of those
-can be answered from a process already running inside it.
+The OUTER half is this file, run as `python3 ci/smoke.py` on the runner and driving `docker`. It
+checks the container as an object: `docker inspect`, the real command's log, the configuration
+guard, liveness and shutdown.
 
-The two INNER halves are PROBES: programs that live here as string constants and are fed to
-`docker exec -i <name> python -u -`. The IMAGE probe answers everything about the FILES and the
-dependencies inside the image. The SERVICE probe answers WHO the running process is and whether it
-is really SERVING — over HTTP and, more importantly, over DNS.
+The two INNER halves are probes kept here as string constants and fed to
+`docker exec -i <name> python -u -`. The IMAGE probe checks files and dependencies inside the image;
+the SERVICE probe checks who the running process is and whether it serves HTTP and DNS.
 
-They run inside for two reasons. The obvious one is that those objects only exist in there. The
-other shapes this whole file: **this job and the docker daemon are not in the same network
-namespace.** Gitea's act_runner executes the job inside its own job container while the `docker` CLI
-it provides drives a daemon outside it.
+No port is published: act_runner runs this job in its own container, so the job's 127.0.0.1 is not
+the daemon's and a published port would be unreachable. Everything internal goes through
+`docker exec`, inside the container's own network namespace.
 
-NO PORT IS PUBLISHED by anything here, and for this service that is a real trap rather than a
-detail: it does listen — 53/udp and 80/tcp — so publishing looks like the obvious way to check it.
-It would check nothing. A published port lands in the HOST daemon's network namespace, and this
-job's 127.0.0.1 is a different loopback entirely, so the gate would be talking to its own empty port.
-Everything internal therefore goes through `docker exec`, which puts the probe in the container's own
-namespace — where 127.0.0.1 means what the compose healthcheck means by it.
+`docker exec` bypasses ENTRYPOINT and runs as the image's `Config.User`, which is unset, so probes
+run as root while the service runs as uid 1000 (/entrypoint.sh chowns the state directory and
+`exec`s gosu). Hence the non-root check reads PID 1's uid, and the contract check pins ENTRYPOINT to
+an exact value.
 
-Two more properties of `docker exec` are worth stating because checks below depend on them, and both
-cut the same way. It does NOT go through ENTRYPOINT, and it runs as the image's `Config.User` —
-which the Dockerfile deliberately leaves unset, so every probe here arrives as ROOT while the
-service itself does not. The image declares `/entrypoint.sh`, which starts as root, chowns the state
-directory and `exec`s gosu to drop to uid 1000. A probe that asked for its OWN uid would therefore
-answer 0 on a perfectly good image, and 0 just the same on one that never drops privileges at all.
-So the non-root check interrogates PID 1 — the only process in the container that came through the
-entrypoint — and the contract check pins the ENTRYPOINT to an exact value rather than reading the
-privilege drop off the image's declarations, which cannot show whether it still happens.
+No capability is granted: docker sets net.ipv4.ip_unprivileged_port_start=0 inside a container, so
+uid 1000 binds 53 and 80 unprivileged, as in production.
 
-Nothing here grants a capability to bind 53/udp, and nothing needs to: docker sets
-net.ipv4.ip_unprivileged_port_start=0 inside a container, so uid 1000 binds 53 and 80 with an empty
-capability set. That is why docker-compose.yml carries no `cap_add` and why the containers below are
-started without one — the gate runs the image the way production does.
+THE TEST BED: NO PROXMOX
+------------------------
+The serving container gets TWO PROXMOX_HOSTS entries at two different RFC 5737 addresses where no
+PVE answers. Unreachable: nothing on the way to binding the sockets may wait for Proxmox (the client
+is built lazily by `ensure_client()` and the startup fetch runs under a deadline), so the three
+startup markers must still appear (check (d)). Two and distinct: the service runs with several
+hosts, and distinct addresses let check (l) count which hosts are polled.
 
-WHY A CONTAINER WITH NO PROXMOX IS THE CORRECT TEST BED
--------------------------------------------------------
-The serving container is started with TWO PROXMOX_HOSTS entries at two DIFFERENT unroutable
-addresses (RFC 5737 documentation ranges), where no PVE will ever answer. All three of those
-properties are deliberate — an unreachable host is what check (d) is about, more than one of them is
-the configuration the service actually runs in, and telling them apart is what lets check (l) count
-the hosts that are really polled — and this is the single most important thing to understand before
-editing either check.
-
-The regression this guards against was a network call made on the way to binding the sockets. With
-password auth proxmoxer authenticated EAGERLY — `ProxmoxAPI(...)` built a `ProxmoxHTTPAuth` whose
-`__init__` posts to `/access/ticket` — and src/app.py called `build_client()` on the first line of
-`run()`, so an unreachable PVE killed the process BEFORE the DNS and HTTP servers ever bound. With
-`restart: always` that is a crash loop in which the zone resolves nowhere at all. `ensure_client()`
-is the fix: the client is built lazily, the servers start regardless, and the updater retries.
-
-API token auth has since moved the eager call: proxmoxer's token auth stores the token and builds a
-header per request, so the constructor talks to nothing and the first real request is the startup
-fetch instead. THAT DOES NOT MAKE THIS TEST BED OBSOLETE — it makes it the same test one layer down.
-The startup fetch still goes to an unreachable host, on every configured host at once and under a
-deadline, and the three startup markers below are still the receipt that nothing on the way to the
-sockets waits for Proxmox. If that ever stops holding, they stop appearing and this gate goes red
-before the image can reach the registry.
-
-An empty zone is also what makes the DNS check exact rather than approximate: with no VMs known,
-src/dns_server.py answers NXDOMAIN, so there is one right answer to compare against instead of
-whatever a live cluster happens to hold.
+An empty zone also makes the DNS check exact: with no VMs known, src/dns_server.py answers NXDOMAIN.
 
 THE CHECKS
 ----------
-Each one is written against a way this image has a realistic chance of shipping broken:
-
-* (a) the image's declared contract: CMD, WORKDIR, and the ENTRYPOINT that drops privileges. Outer
-      half.
-* (b) `curl` is present AND runs. Not cosmetic and not a style preference: the compose healthcheck
-      is `["CMD", "curl", "-f", "http://localhost:80"]`, and the Portainer updater waits 120 s for
-      `healthy` before rolling the image back. A base-image bump that drops curl does not fail
-      loudly — every subsequent update silently rolls back while the image itself looks fine.
-      Image probe.
-* (c) the configuration guard really refuses: started with NO environment, the image names the
-      required variable and exits non-zero. Outer half.
-* (d) the real command starts and reports all three startup markers with PVE unreachable — the
-      regression described above. Outer half.
-* (e) the HTTP status server answers: /health, /json, / and a 404 for anything else. Service probe.
-* (f) the DNS server answers a real UDP query on 127.0.0.1:53, for both an A question and a PTR
-      question — PTR takes a separate branch through src/dns_server.py and would not be covered by
-      the A query. Service probe.
-* (g) .dockerignore did its job: no tests/, .env, .venv or .gitea/ in the image. Image probe.
+* (a) the declared contract: CMD, WORKDIR and the ENTRYPOINT that drops privileges. Outer half.
+* (b) `curl` is present and runs: the compose healthcheck uses it, and the Portainer updater rolls
+      the image back if it does not see `healthy` within 120 s. Image probe.
+* (c) the configuration guard refuses: with no environment the image names the required variable
+      and exits non-zero. Outer half.
+* (d) the real command starts and logs all three startup markers with PVE unreachable. Outer half.
+* (e) the HTTP status server answers /health, /json, / and a 404 for anything else. Service probe.
+* (f) the DNS server answers a real UDP query on 127.0.0.1:53 for an A and a PTR question (PTR takes
+      a separate branch in src/dns_server.py). Service probe.
+* (g) .dockerignore kept tests/, .env, .venv and .gitea/ out of the image. Image probe.
 * (h) the runtime dependencies import: dns, proxmoxer, pydantic_settings, requests. Image probe.
-* (i) the container is still alive once everything else has had its turn at it, and the log it has
-      at the very end, after (k) has stopped it, carries no traceback. Outer half.
-* (j) PID 1 — the process the ENTRYPOINT actually started — serves as uid 1000 and not as root. This
-      is the artefact, not the intention: a Dockerfile can carry every non-root instruction there is
-      and still serve as root the moment /entrypoint.sh stops `exec`ing gosu, and (a) would not see
-      it — an image keeps declaring its ENTRYPOINT whatever the script inside it does. Service
-      probe, because it is the only one running where PID 1 can be read.
-* (k) `docker stop` really stops it: SIGTERM reaches PID 1, something ACTS on it, and the container
-      exits 0 instead of sitting out the grace period until the kernel kills it. Two things have to
-      hold for that, and only one of them is visible anywhere else in this file. /entrypoint.sh must
-      `exec`, so python is PID 1 and the signal is delivered at all — (j) catches only the crudest
-      loss of that, since under `su` PID 1 would run as uid 0, while a `sh -c "python main.py"`
-      wrapper keeps the uid and drops the signal all the same. AND src/app.py must install a
-      handler, because PID 1 gets NO default signal dispositions from the kernel: an unhandled
-      SIGTERM at PID 1 is dropped rather than applied, so a process that is PID 1 and does nothing
-      about it passes every other check in this file and still has to be SIGKILLed. Every redeploy
-      would then take the `.lc` zone down for the whole grace period instead of for the second it
-      takes to swap the container. Runs LAST of everything that touches the container, because it
-      ENDS it. Outer half.
-* (l) every configured host is actually polled. The two PROXMOX_HOSTS entries are at distinct
-      addresses and the service attributes every failure to the host it came from, so the check is
-      that BOTH names appear in the log. It is the only thing here that would catch a walk over
-      `_hosts` quietly becoming `_hosts[0]`: a build in that state starts, binds, serves and logs
-      failures — all from the first host — while every other host's guests are missing from the
-      zone for ever. Runs right after (d), off the snapshot that check already took. Outer half.
+* (i) the container is still alive once everything else has run, and its final log, after (k) has
+      stopped it, carries no traceback. Outer half.
+* (j) PID 1 serves as uid 1000, not root. (a) cannot see this: the image keeps declaring its
+      ENTRYPOINT whatever the script does. Service probe, the only place PID 1 can be read.
+* (k) `docker stop` stops it with exit 0 within the grace period. Requires both that
+      /entrypoint.sh `exec`s (python is PID 1 and receives SIGTERM) and that src/app.py installs a
+      handler (PID 1 has no default signal dispositions, so an unhandled SIGTERM is dropped). Runs
+      last of everything that touches the container, because it ends it. Outer half.
+* (l) every configured host is polled: the service attributes each failure to its host, so both
+      names must appear in the log. Catches a loop over `_hosts` reduced to `_hosts[0]`. Runs right
+      after (d), off the same log snapshot. Outer half.
 
-Two properties matter and are easy to lose, so they are stated where they can be checked:
+Invariants:
 
-* Failures leave through SystemExit, never `assert` — on all three sides of the split. Asserts vanish
-  under PYTHONOPTIMIZE=1, which would silently turn this gate permanently green.
-* Every check runs before the run is judged, so one run shows the full extent of the breakage
-  instead of only the first broken thing. A check that CANNOT run reports itself as FAILED; it is
-  never quietly skipped, which is the classic way a gate keeps reporting success while proving less
-  and less. Each probe's own report lines are parsed back into this gate's report, so a failure
-  inside the container is one row in the same list as a failure outside it.
+* Failures leave through SystemExit, never `assert`, on all three sides: asserts vanish under
+  PYTHONOPTIMIZE=1.
+* Every check runs before the run is judged, so one run shows all breakage. A check that cannot run
+  reports FAILED and is never skipped. Probe report lines are parsed back into this gate's report.
 
-Nothing here holds a credential, and nothing it starts reaches a service anywhere: the only
-addresses the container is given are RFC 5737 documentation addresses, reserved for use in examples
-and routed nowhere, and the API token beside them is a literal that authenticates nothing. That is
-what lets this same gate run on a pull request.
+Nothing here holds a credential: the addresses are RFC 5737 documentation addresses and the token is
+a literal, which is what lets the same gate run on a pull request.
 """
 
 import json
@@ -148,13 +80,9 @@ import time
 # The tag to test. Required rather than defaulted: a default would let a mistyped `env:` block in a
 # workflow silently gate some other image that happens to be on the daemon.
 IMAGE_ENV = "SMOKE_IMAGE"
-# Base name for every container this gate starts. The workflows put the run id in it, because the
-# runner has ONE docker daemon shared by every repository in the fleet and two concurrent runs must
-# not collide on a name — remove_container() below would otherwise delete another run's live
-# container out from under it. Required for a second reason too: the workflow's `if: always()`
-# cleanup step builds the same names from the same variable, so a default here would leave this
-# script naming its containers one way while the cleanup went looking for another, found nothing,
-# and swallowed the miss in its `|| true`.
+# Base name for every container this gate starts. The workflows put the run id in it so concurrent
+# runs on the shared daemon do not collide (remove_container() would delete another run's container).
+# Required, not defaulted: the workflow's `if: always()` cleanup builds the same names from it.
 NAME_ENV = "SMOKE_NAME"
 
 GUARD_SUFFIX = "-guard"
@@ -165,17 +93,14 @@ ALL_SUFFIXES = (GUARD_SUFFIX, SERVE_SUFFIX)
 # --- The image's declared contract -------------------------------------------------------------
 APP_DIR = "/app"
 EXPECTED_CMD = ["python", "main.py"]
-# Pinned to an exact value rather than merely asserted to exist. This is the only script that stands
-# between the image and serving as root, and every other check in this gate reaches the container
-# through `docker exec`, which walks straight past it — so an image that lost the ENTRYPOINT would
-# answer all of them exactly as it does now while quietly going back to running python as uid 0.
+# Pinned to an exact value: it is what drops root, and every other check reaches the container
+# through `docker exec`, which bypasses it.
 EXPECTED_ENTRYPOINT = ["/entrypoint.sh"]
 
 # --- The three startup markers ------------------------------------------------------------------
 # All three are logged at CRITICAL by src/app.py, src/dns_server.py and src/http_server.py, so they
-# survive any LOG_LEVEL. The DNS and HTTP ones are printed from their own threads, so the ORDER
-# between them is not fixed — which is why the wait below is for all three rather than for a last
-# one, and why nothing here reads them positionally.
+# survive any LOG_LEVEL. The DNS and HTTP ones come from their own threads, so their order is not
+# fixed and nothing here reads them positionally.
 STARTUP_MARKER = "ProxDNS server started"
 DNS_MARKER = "[DNS] Server run on port 53/udp on 0.0.0.0..."
 HTTP_MARKER = "[HTTP] Server started on port 80..."
@@ -183,33 +108,20 @@ STARTUP_MARKERS = (STARTUP_MARKER, DNS_MARKER, HTTP_MARKER)
 
 # --- What the configuration guard must say ------------------------------------------------------
 # src/config_errors.py prints this block to stderr and raises SystemExit(1) when a required variable
-# is missing. There is exactly ONE required variable now — the whole Proxmox configuration arrives as
-# a JSON list in PROXMOX_HOSTS — and it is still checked by NAME rather than by the header alone: a
-# guard that fires without saying what is missing sends whoever reads it to the source.
+# is missing. The one required variable is PROXMOX_HOSTS, checked by name: the guard must say what is
+# missing.
 GUARD_HEADER = "Configuration error in environment / .env:"
 GUARD_MISSING_LINE = "Missing required variable(s):"
 REQUIRED_VARIABLES = ("PROXMOX_HOSTS",)
 
 # --- The environment the serving container gets -------------------------------------------------
-# TWO ENTRIES AT TWO DIFFERENT ADDRESSES, and both halves of that are load-bearing.
+# Two entries, because the service polls several independent hosts (a thread, client and slice of
+# the zone each). Different addresses, so each host's failure line is identifiable and
+# check_every_host_is_polled() can tell all hosts from `_hosts[0]` only.
 #
-# Two, because the service polls N INDEPENDENT hosts — a thread, a client and a slice of the zone
-# each, merged into one list — so N>1 is the configuration it actually runs in, and a regression
-# that only appears with more than one host would otherwise sail through both the unit tests and
-# this gate.
-#
-# DIFFERENT, because identical addresses are not countable. With both entries pointing at the same
-# host, everything the log says about one of them says exactly the same about the other, and the
-# commonest way to break multi-host support — polling only `_hosts[0]` — produces a log this gate
-# cannot tell from a healthy one. Distinct addresses make each host's own failure line identifiable,
-# which is what check_every_host_is_polled() below reads.
-#
-# RFC 5737 documentation addresses (TEST-NET-1 and TEST-NET-2): reserved for exactly this, routed
-# nowhere, and nothing on the runner or beyond it answers on them. So every request the service
-# makes fails — which is the state the lazy startup exists for and what check (d) is about — but it
-# fails by TIMING OUT rather than by being refused, at proxmoxer's 5 s per request. The hosts are
-# fetched concurrently, so that costs the boot one timeout rather than two, and BOOT_BUDGET below
-# has room for many more than that. The token authenticates nothing anywhere.
+# RFC 5737 addresses (TEST-NET-1, TEST-NET-2) route nowhere: every request times out at proxmoxer's
+# 5 s rather than being refused. Hosts are fetched concurrently, so the boot pays one timeout. The
+# token authenticates nothing.
 SERVE_HOSTS = ("192.0.2.1", "198.51.100.1")
 SERVE_ENV = [
     "PROXMOX_HOSTS=" + json.dumps([
@@ -221,10 +133,8 @@ SERVE_ENV = [
 TRACEBACK_MARKER = "Traceback (most recent call last)"
 
 # --- Probe markers and their exact target counts ------------------------------------------------
-# Each probe prints its marker with a count on its LAST line. The count is compared exactly, not
-# searched for as a substring: a probe that stopped emitting rows would otherwise finish, exit 0,
-# and take its own missing verdicts with it — the one failure mode nothing else here can see,
-# because every row it DID print says ok.
+# Each probe prints its marker with a count on its last line. The count is compared exactly, so a
+# probe that silently stopped emitting rows still fails.
 IMAGE_PROBE_MARKER = "proxmox_dns image probe ok"
 SERVICE_PROBE_MARKER = "proxmox_dns service probe ok"
 EXPECTED_IMAGE_PROBE_TARGETS = 11
@@ -246,8 +156,8 @@ EXPECTED_TOTAL_TARGETS = (
     + EXPECTED_SERVICE_PROBE_TARGETS + 2)
 
 # --- Bounds -------------------------------------------------------------------------------------
-# Every docker call is bounded, so a hung daemon surfaces as a named failure rather than as a step
-# killed by its own timeout with nothing said about which call stopped.
+# Every docker call is bounded, so a hung daemon surfaces as a named failure rather than as a killed
+# step.
 INSPECT_TIMEOUT = 30
 REMOVE_TIMEOUT = 30
 GUARD_TIMEOUT = 60
@@ -255,32 +165,20 @@ START_TIMEOUT = 60
 LOGS_TIMEOUT = 30
 IMAGE_PROBE_TIMEOUT = 120
 SERVICE_PROBE_TIMEOUT = 120
-# What `docker stop` gives the process before the kernel takes over, and it has to be generous for
-# check (k) to mean anything: a bound short enough to kill a process that WAS shutting down would
-# report a working image as one that never got the signal. A correct image needs a fraction of this
-# — the main loop returns as soon as the handler sets its Event and the interpreter exits.
-#
-# DELIBERATELY NOT the 45 s docker-compose.yml asks for. That value buys the SLOW case: a stop that
-# lands while the startup fetch is out at an unreachable PVE, which PEP 475 makes the process finish
-# before it notices anything. This gate stops a container that is long past startup and sitting in
-# its reporting loop, so the slow case is not the one under test here — and copying 45 s in would
-# only make a genuinely wedged image take more than twice as long to be reported as wedged.
+# Grace period for `docker stop` in check (k): generous so a process that is shutting down is not
+# reported as deaf; a correct image needs a fraction of it. Not the 45 s from docker-compose.yml,
+# which covers a stop during the startup fetch; this gate stops a container long past startup.
 SIGTERM_GRACE = 20
-# Must exceed SIGTERM_GRACE, or the docker CLIENT would be killed on the runner while the daemon
-# was still waiting out the grace period — and the container would then be judged by an inspect
-# that ran mid shutdown.
+# Must exceed SIGTERM_GRACE, or the client would be killed while the daemon still waits out the
+# grace period.
 STOP_TIMEOUT = 60
 
-# Wall-clock budget for all three startup markers to appear. Generous against a cold, loaded runner:
-# the process has to import pydantic, dnspython and proxmoxer, run the startup fetch out against two
-# unroutable addresses — concurrently, and capped by INITIAL_FETCH_DEADLINE at 10 s even if
-# proxmoxer's own 5 s timeout ever stopped applying — and bind two sockets.
+# Wall-clock budget for all three startup markers on a cold runner: imports, the startup fetch
+# (capped by INITIAL_FETCH_DEADLINE at 10 s) and binding two sockets.
 BOOT_BUDGET = 60
 BOOT_PAUSE = 0.5
-# The same, for each host's first failure line. A separate budget because it is a separate claim
-# and because the lines can legitimately arrive after the markers: the startup fetch abandons a host
-# at INITIAL_FETCH_DEADLINE and lets the sockets bind, so a host slower than that logs its failure
-# afterwards — and its updater thread retries every couple of seconds regardless.
+# The same, for each host's first failure line, which may arrive after the markers: the startup
+# fetch abandons a host at INITIAL_FETCH_DEADLINE, and its updater thread retries afterwards.
 HOST_FAILURE_BUDGET = 45
 
 EXCERPT_CHARS = 4000
@@ -289,10 +187,8 @@ EXCERPT_CHARS = 4000
 # ================================================================================================
 # The IMAGE probe: files and dependencies inside the image.
 # ================================================================================================
-# Runs via `docker exec` in the SERVING container rather than in an idle one of its own. That is a
-# deliberate simplification this image earns: its real command survives an unreachable PVE (see the
-# module docstring), so the container running the actual service is available to be asked about its
-# own files — which is a slightly stronger claim than asking a container started with a sleep.
+# Runs via `docker exec` in the serving container: its real command survives an unreachable PVE,
+# so no separate idle container is needed.
 IMAGE_PROBE = r'''
 import os
 import subprocess
@@ -743,11 +639,8 @@ def satisfied(logs, marker):
 def wait_for_markers(name, markers, budget):
     """Poll `docker logs` until EVERY marker has appeared, or the budget runs out.
 
-    All of them, not the first: the DNS and HTTP markers come from two different threads, so their
-    order is not fixed and returning on whichever arrived first would leave the other unproven while
-    reporting success. Bounded in WALL CLOCK rather than in attempts, because each attempt shells out
-    to `docker logs` with its own bound and an attempt-counted loop would multiply into minutes on a
-    slow daemon.
+    All of them: the DNS and HTTP markers come from different threads in no fixed order. Bounded in
+    wall clock rather than attempts, since each attempt has its own `docker logs` bound.
 
     Returns (status, logs) from the last poll.
     """
@@ -764,10 +657,8 @@ def wait_for_markers(name, markers, budget):
 def host_failure_markers(address):
     """Every line this service prints when ONE host does not answer, for that host.
 
-    Any one of them proves the host was reached for: src/proxmox.py stamps the host on both of its
-    error paths, and src/app.py stamps it on the two of its own. Which one appears depends on
-    nothing this gate controls — the startup fetch and the updater race, and either may be first —
-    so the requirement is the set rather than any single line.
+    Any one proves the host was polled: src/proxmox.py and src/app.py each stamp the host on two
+    error paths, and the startup fetch and the updater race, so any of the four may come first.
     """
     return (
         "[Proxmox] {}: failed to list nodes".format(address),
@@ -805,12 +696,9 @@ def check_image_contract(image):
             "a silent change here means the gate and the deployment are describing two different "
             "programs".format(cmd))))
 
-    # The ENTRYPOINT prepends itself to the CMD above, and that is the whole privilege drop: the
-    # image runs `/entrypoint.sh python main.py`, the script starts as root, chowns the state
-    # directory and `exec`s gosu to hand the process to uid 1000. Losing this line does not break
-    # anything visibly — the CMD still runs, the service still serves, every other check here still
-    # passes — it just serves as root again, which is precisely why it is pinned by value here and
-    # cross-checked against PID 1's real uid in the service probe.
+    # The ENTRYPOINT is the whole privilege drop (`/entrypoint.sh python main.py` execs gosu to uid
+    # 1000). Losing it breaks nothing visible, so it is pinned by value here and cross-checked
+    # against PID 1's uid in the service probe.
     entrypoint = config.get("Entrypoint")
     rows.append((
         "the image's ENTRYPOINT is {}".format(EXPECTED_ENTRYPOINT),
@@ -832,10 +720,8 @@ def check_image_contract(image):
 def check_config_guard(image, name):
     """(c) Started with NO configuration, the image refuses and says exactly what is missing.
 
-    Run in the FOREGROUND so `docker run` hands back the container's own exit status. Both halves are
-    checked — the message and the code — because either alone is satisfiable by the wrong thing: a
-    process that printed the right text and exited 0 would be deployed and left running broken, and
-    one that exited 1 silently sends an operator to read the source.
+    Run in the foreground so `docker run` returns the container's exit status. Both the message and
+    the non-zero code are checked.
     """
     rows = []
     remove_container(name)
@@ -866,9 +752,7 @@ def check_config_guard(image, name):
         None if GUARD_MISSING_LINE in output else "the output does not contain it:\n{}".format(
             excerpt(output))))
     for variable in REQUIRED_VARIABLES:
-        # A row per required variable. There is one of them today; the loop stays because the row it
-        # produces is the only one that says WHICH variable the guard named, and a guard that fires
-        # without naming it is a guard an operator has to read the source to act on.
+        # One row per required variable: the guard must name which one is missing.
         rows.append((
             "it names {} as missing".format(variable),
             None if variable in output else (
@@ -880,11 +764,8 @@ def check_config_guard(image, name):
 def start_serving_container(image, name):
     """Start the image with its REAL command and an unreachable PVE.
 
-    NO PORT IS PUBLISHED — see the module docstring. The container is given two PROXMOX_HOSTS
-    entries at two unroutable addresses on purpose: an unreachable host is the state the lazy
-    startup exists for, two of them is the shape the service actually runs in, distinct ones are
-    what check (l) can count, and the startup markers below are the receipt that all of it is
-    still survivable.
+    No port is published; the two unroutable PROXMOX_HOSTS entries are explained in the module
+    docstring.
     """
     target = "`docker run -d` starts the image with its own command"
     remove_container(name)
@@ -901,12 +782,7 @@ def start_serving_container(image, name):
 def check_startup_markers(name, started):
     """(d) All three startup markers appear, with PVE unreachable.
 
-    This is the regression check. Before ensure_client(), `build_client()` was the first statement of
-    run() and proxmoxer's password auth authenticated in its constructor — so with no PVE to reach,
-    the process died before any of these three lines was ever printed, and did so again on every
-    restart. Token auth has since moved the first network call to the startup fetch, which goes to
-    the same unreachable address; what these markers assert is unchanged, namely that nothing on the
-    way to the sockets waits for Proxmox to answer.
+    Asserts that nothing on the way to binding the sockets waits for Proxmox to answer.
     """
     if not started:
         reason = "not attempted: the serving container never started"
@@ -932,20 +808,11 @@ def check_startup_markers(name, started):
 def check_every_host_is_polled(name, started, boot_logs):
     """(l) EVERY configured host is really polled, not just the first one.
 
-    The service's whole shape is N independent hosts with a thread, a client and a slice of the
-    zone each. The cheapest way to break that is to stop walking the list — `_hosts[0]` instead of
-    `_hosts` — and the result looks perfectly healthy from everywhere else in this gate: the
-    process starts, both sockets bind, the status page answers, the log fills with failures from
-    the host that IS being polled. Only the absence of the OTHER host's name says anything, and
-    only because the two addresses differ.
+    Polling only `_hosts[0]` looks healthy everywhere else in this gate; only the missing name of
+    the other host shows it, which is why the addresses are distinct.
 
-    It reads the log rather than asking the container anything, which is why the addresses have to
-    be distinct: what is being counted is host identities appearing in output the service itself
-    attributes.
-
-    `boot_logs` is the snapshot check (d) already paid for; on a healthy image both hosts have
-    failed long before the startup markers are printed, so the usual case costs no `docker logs`
-    call at all. The bounded wait is for the case where one host's failure genuinely arrives later.
+    `boot_logs` is check (d)'s snapshot, which usually already carries both hosts' failures; the
+    bounded wait covers a failure that arrives later.
     """
     targets = ["the log carries a failure attributed to the configured host {}".format(address)
                for address in SERVE_HOSTS]
@@ -976,10 +843,8 @@ def check_every_host_is_polled(name, started, boot_logs):
 def run_probe(name, started, program, timeout, marker, expected_targets, prefix, label):
     """Feed one probe to `docker exec -i <name> python -u -` and merge its verdicts into ours.
 
-    `-i` attaches stdin without asking for a tty (none is needed and none is available on a runner),
-    the image's own interpreter runs the program, and `docker exec` propagates the command's exit
-    status — which is what lets the two consistency rows below tell "the probe reported failures"
-    apart from "the probe died before it could report anything".
+    `-i` attaches stdin without a tty. `docker exec` propagates the exit status, which lets the two
+    consistency rows below tell "reported failures" from "died before reporting".
     """
     exit_target = "the {} probe's exit status agrees with its own report".format(label)
     marker_target = "the {} probe ran to its end, reporting all {} targets".format(
@@ -995,9 +860,8 @@ def run_probe(name, started, program, timeout, marker, expected_targets, prefix,
 
     rows = probe_report_rows(output, prefix)
     if not rows:
-        # Exit status alone cannot be read here: a probe that printed nothing has told us nothing,
-        # whatever it exited with. This is what a `docker exec` that could not start the interpreter
-        # looks like, and what a truncated stdin looks like.
+        # A probe that printed nothing has told us nothing, whatever it exited with (interpreter
+        # failed to start, or truncated stdin).
         return [("the {} probe".format(label), (
             "it produced no report lines at all, so none of its checks ran. `docker exec` exited "
             "{}. Output:\n{}".format(status, excerpt(output))))], output
@@ -1025,9 +889,8 @@ def run_probe(name, started, program, timeout, marker, expected_targets, prefix,
             "the program did not run to the end — a truncated stdin, or something that killed the "
             "interpreter mid-report".format(marker))))
     else:
-        # It finished, but with a different number of verdicts than this gate expects. That is a gate
-        # that has quietly started proving less, which is the failure mode nothing else here can see:
-        # every row it DID print says ok, and the exit status is 0.
+        # Finished with a different number of verdicts than expected: a check stopped emitting rows
+        # or one was added.
         summary = [line for line in output.splitlines() if line.startswith(marker)]
         rows.append((marker_target, (
             "it ran to the end but reported {!r} instead of {} targets. Either a check stopped "
@@ -1061,31 +924,15 @@ def check_container_alive(name, started):
 def check_sigterm_shutdown(name, started):
     """(k) SIGTERM reaches PID 1 and it shuts ITSELF down instead of being killed.
 
-    `docker stop` is exactly what a redeploy does: SIGTERM, wait out the grace period, then
-    SIGKILL. So this check is the redeploy, run against the image before it can be pushed.
+    `docker stop` is what a redeploy does. Exit 0 means /entrypoint.sh `exec`ed (python is PID 1)
+    and src/app.py installed a handler that sets the Event its main loop waits on.
 
-    An exit code of 0 means the signal was both delivered and acted on: /entrypoint.sh `exec`ed, so
-    python is PID 1, AND src/app.py installed a handler that sets the Event its main loop waits on.
-    Both are needed and the two failure codes below say which half went.
+    137 (128+9): SIGKILL after the grace period; PID 1 has no default signal dispositions, so with
+    no handler SIGTERM is dropped. 143 (128+15): SIGTERM hit a process with the default disposition,
+    i.e. the handler is gone and python is not PID 1 (a shell wrapper took the slot).
 
-    137 is 128+9 — SIGKILL, sent because the grace period ran out with the process still alive.
-    That is the shape of the bug this check was written for: PID 1 gets no default signal
-    dispositions from the kernel, so a python process that installs no handler has SIGTERM DROPPED
-    on it and does not even notice the stop. Nothing else in this gate can see that — the container
-    is PID 1, runs as uid 1000 and serves both protocols perfectly right up to the moment it has to
-    be killed.
-
-    143 is 128+15 — SIGTERM arrived and terminated the process outright, i.e. it was delivered to
-    something with the default disposition. On this image that means the handler is gone but python
-    is no longer PID 1 either (a shell wrapper took the slot), because at PID 1 the same missing
-    handler produces 137 instead.
-
-    Either way the cost is the same and it is not abstract: the `.lc` zone resolves nowhere for the
-    whole grace period on every single redeploy, instead of for the moment it takes the replacement
-    container to bind :53.
-
-    LAST of everything that touches the container, because it ENDS it. check_final_log() below
-    still reads the log of a stopped container, and `docker rm -f` still removes one.
+    Runs last of everything that touches the container, because it ends it. check_final_log() and
+    `docker rm -f` still work on a stopped container.
     """
     stop_target = "`docker stop` completes within the {} s grace period".format(SIGTERM_GRACE)
     code_target = "the serving container exits 0 on SIGTERM rather than being killed"
@@ -1095,9 +942,8 @@ def check_sigterm_shutdown(name, started):
 
     status, output = docker(["stop", "-t", str(SIGTERM_GRACE), name], STOP_TIMEOUT)
     if status is None:
-        # No exit code at all: the bound fired or docker is missing, and neither is a verdict about
-        # the image. `docker stop` itself exits 0 even when it had to SIGKILL, so the exit code
-        # below is the row that judges the shutdown; this one only says the call completed.
+        # No exit code: the bound fired or docker is missing. `docker stop` exits 0 even after a
+        # SIGKILL, so the container's exit code below is what judges the shutdown.
         return [(stop_target, output), (code_target, "not attempted: " + output)]
     if status != 0:
         reason = "`docker stop` exited {}:\n{}".format(status, excerpt(output))
@@ -1129,22 +975,10 @@ def check_sigterm_shutdown(name, started):
 def check_final_log(name, started):
     """(i) The log the container has BY NOW is free of tracebacks.
 
-    Read fresh, at the end, rather than reusing the snapshot the boot wait returned: everything else
-    in this gate has run against the container since then, and a crash provoked by one of the probes
-    would be invisible in the older copy.
+    Read fresh at the end, so a crash provoked by a probe is visible.
 
-    Some expected error lines are NOT tracebacks and are deliberately not treated as such. With PVE
-    unreachable the log carries `[Proxmox] <host>: failed to list nodes` from the startup fetch and
-    then `[Proxmox] <host>: failed to query cluster resources` from the updater, once every couple
-    of seconds and once per configured host. Those messages are the degradation working — check (l)
-    above depends on them being there and on each one naming its own host.
-
-    NOTE THAT THE CLIENT-BUILD FAILURE IS NO LONGER AMONG THEM. It used to be the expected line here
-    — `[Proxmox] Cannot build the API client, will keep retrying` — because proxmoxer's password auth
-    authenticated inside the constructor. Token auth builds the client without touching the network,
-    so that line does not appear at all and the failure surfaces one layer later, on the first
-    request. A TRACEBACK, by contrast, means something escaped a handler that was supposed to
-    contain it.
+    The expected `[Proxmox] <host>: failed to ...` lines from the startup fetch and the updater are
+    not tracebacks; check (l) relies on them. A traceback means something escaped a handler.
     """
     target = "the serving container's final log is free of tracebacks"
     if not started:
@@ -1208,31 +1042,24 @@ def main():
         transcripts.append(("the service probe, from inside the container", service_probe_output))
         rows.extend(service_probe_rows)
 
-        # After the probes on purpose: "the container is still up" is only worth anything once
-        # everything else has had its turn at it. Before the stop below for the same reason — this
-        # row is about a container that is supposed to be alive.
+        # After the probes and before the stop below.
         rows.extend(check_container_alive(name + SERVE_SUFFIX, serve_started))
 
         # Ends the container, so it goes after everything that needed it alive and before the two
         # steps that do not: the final log and the cleanup both work on a stopped container.
         rows.extend(check_sigterm_shutdown(name + SERVE_SUFFIX, serve_started))
 
-        # LAST, and that is the reason it exists: the log the container has at this point is the
-        # whole run rather than the snapshot the boot wait returned.
+        # Last: the log now covers the whole run, not the boot snapshot.
         final_rows, final_logs = check_final_log(name + SERVE_SUFFIX, serve_started)
         rows.extend(final_rows)
         transcripts.append(("the serving container", final_logs))
     finally:
-        # Both, unconditionally. When a bound fires inside docker() it kills the docker CLIENT on the
-        # runner, not the container on the daemon, so a hung run would otherwise sit here pinning the
-        # image until somebody noticed. The workflow removes the same names again under
-        # `if: always()`, which covers this whole script being killed by the step timeout.
+        # Both, unconditionally: a bound firing in docker() kills the client, not the container.
+        # The workflow removes the same names again under `if: always()`.
         for suffix in ALL_SUFFIXES:
             remove_container(name + suffix)
 
-    # The transcripts first, the verdicts last: in a CI log the verdicts are what somebody scrolls to
-    # the bottom for, and the containers' own output is what turns a one-line verdict into a
-    # diagnosis.
+    # Transcripts first, verdicts last, where a CI log reader scrolls to.
     for label, text in transcripts:
         print("")
         print("--- {} ---".format(label))
@@ -1240,17 +1067,9 @@ def main():
     print("")
     print("--- results ---")
 
-    # Before a single verdict is printed: the NUMBER of verdicts is itself one. A check_* that
-    # stopped emitting rows takes its own verdicts out of the report and takes nothing red with them,
-    # so the run would end `smoke ok: 34/34`, exit 0, and have every printed row saying ok with two
-    # claims silently no longer made.
-    #
-    # ONLY on a run where nothing else failed, and that is not laziness about the arithmetic. A
-    # failing check_* legitimately reports fewer rows than its happy path — check_image_contract
-    # emits 1 instead of 3 when `docker inspect` cannot answer, run_probe 1 instead of 13 when its
-    # exec timed out — so on an already-red run this row would fire too, on top of the real failure,
-    # and read as though the GATE were broken. The fault it exists to catch is invisible on a red run
-    # and decisive on a green one, which is exactly where it is still reported.
+    # The number of verdicts is itself a verdict: a check_* that stopped emitting rows would
+    # otherwise leave an all-ok report. Checked only on an otherwise green run, because failing
+    # checks legitimately emit fewer rows than their happy path.
     if len(rows) != EXPECTED_TOTAL_TARGETS and not any(reason is not None for _, reason in rows):
         rows.append((
             "this gate produced all {} of the verdicts it is supposed to".format(
