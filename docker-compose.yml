@@ -20,6 +20,8 @@ services:
   proxmox_dns:
     image: gitea.vvzvlad.xyz/projects/proxmox_dns:latest
     container_name: proxmox_dns
+    # `always`, not `unless-stopped`: the zone must resolve again after a host or daemon restart
+    # without anyone starting it; a deliberate `docker stop` holds only until the daemon restarts.
     restart: always
     # Longer than docker's 10 s default. Under PEP 475 a SIGTERM handler runs but the interrupted
     # syscall resumes, so a request already out at a black-holing PVE host (5 s timeout per

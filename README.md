@@ -178,3 +178,10 @@ Run `make pve-setup PVE=root@<host>` for **every** host in `PROXMOX_HOSTS` (on P
 `PVE_PRIVS=VM.Audit,VM.Monitor`); re-running it is safe. It prints a new token's value
 only once: put `host`, `user` (`proxmoxdns@pve`), `token_name` (`dns`) and that value
 (`token_value`) into the host's entry in `PROXMOX_HOSTS`.
+
+Both privileges are required. `VM.Audit` makes guests visible; `VM.GuestAgent.Audit`
+(`VM.Monitor` on PVE 8) allows `network-get-interfaces`, where the addresses come from.
+Without the latter every guest still resolves, but to `0.0.0.0` / `::` with no log line:
+`get_vm_ip()` cannot tell the 403 from a guest without an agent. The symptom is one host
+whose every guest shows `0.0.0.0` in the `Host` column of the `/` table. `Sys.Audit` is not
+needed: `/nodes` is not permission-filtered.
