@@ -98,6 +98,7 @@ ONE_NODE = [{"node": "pve"}]
 RUNNING_VM = {"vmid": 100, "name": "foo-bar", "status": "running"}
 OTHER_VM = {"vmid": 200, "name": "bar-baz", "status": "running"}
 STOPPED_VM = {"vmid": 101, "name": "baz-qux", "status": "stopped"}
+TEMPLATE_VM = {"vmid": 900, "name": "tmpl-deb12", "status": "stopped", "template": 1}
 AGENT_ANSWER = {"result": [{"name": "eth0", "ip-addresses": [
     {"ip-address-type": "ipv4", "ip-address": "10.0.0.5"}]}]}
 
@@ -115,6 +116,12 @@ def test_nodes_with_no_guests_behind_them_are_an_empty_slice_not_none():
     domains = proxmox.get_domains(_Proxmox(ONE_NODE), "pve1.test")
 
     assert domains == [], f"nodes listed, no guests: expected [], got {domains!r}"
+
+
+def test_a_template_never_enters_the_zone():
+    domains = proxmox.get_domains(_Proxmox(nodes=ONE_NODE, vms=[TEMPLATE_VM]), "pve1.test")
+
+    assert domains == [], "a template has no address to publish and must not enter the zone"
 
 
 def test_every_node_of_a_cluster_contributes_its_guests():
